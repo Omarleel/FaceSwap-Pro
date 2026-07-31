@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Entradas locales
+inputs/videos/*
+!inputs/videos/.gitkeep
+inputs/source_faces/*
+!inputs/source_faces/.gitkeep
+inputs/target_faces/*
+!inputs/target_faces/.gitkeep
+
+# Modelos y resultados
+models/*.onnx
+!models/.gitkeep
+outputs/videos/*
+!outputs/videos/.gitkeep
+outputs/manifests/*
+!outputs/manifests/.gitkeep
+*.mp4
+*.jpg

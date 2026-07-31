@@ -1,0 +1,73 @@
+engine:
+  model_pack: buffalo_l
+  det_size: [512, 512]
+  det_thresh: 0.55
+  allowed_modules:
+    - detection
+    - recognition
+  max_faces: 10
+  providers:
+    - CUDAExecutionProvider
+    - CPUExecutionProvider
+  cuda:
+    device_id: 0
+    arena_extend_strategy: kNextPowerOfTwo
+    cudnn_conv_algo_search: EXHAUSTIVE
+    cudnn_conv_use_max_workspace: "1"
+    do_copy_in_default_stream: "1"
+    use_tf32: "1"
+
+identity:
+  source_min_score: 0.60
+  target_min_similarity: 0.30
+  max_source_images: 40
+
+tracking:
+  smoothing: 0.68
+  max_missing_frames: 4
+  scene_cut_threshold: 0.42
+  detection_interval: 3
+  full_scan_interval: 90
+  max_recognition_candidates: 2
+  optical_flow: true
+  flow_win_size: 31
+  flow_max_level: 3
+  flow_max_error: 25.0
+
+blend:
+  aligned_size: 384
+  mask_shrink: 0.88
+  mask_blur_ratio: 0.055
+  color_match_strength: 0.68
+  detail_strength: 0.16
+  roi_enabled: true
+  roi_margin: 0.15
+  interpolation: cubic
+
+restorer:
+  enabled: false
+  model_path: models/face_restorer.onnx
+  input_size: 512
+  output_range: auto
+
+encoding:
+  codec: h264_nvenc
+  preset: p4
+  cq: 18
+  audio_bitrate: 256k
+  fallback_codec: libx264
+  fallback_preset: fast
+  fallback_crf: 18
+
+performance:
+  decoder: auto
+  hardware_decode: true
+  reader_queue: 8
+  analysis_queue: 4
+  writer_queue: 8
+  max_inflight: 8
+  postprocess_workers: 0
+  opencv_threads: 0
+
+watermark:
+  text: "CONTENIDO SINTÉTICO · IA"
