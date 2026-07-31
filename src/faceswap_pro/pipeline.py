@@ -5,16 +5,15 @@ import tempfile
 import time
 from pathlib import Path
 
-import insightface
-import onnxruntime as ort
 from rich.console import Console
 
 from .blend import ProfessionalBlender
 from .engine import initialize_models
 from .identity import build_source_identity, load_reference_embedding
+from .modeling import ModelBundle
 from .parallel_pipeline import run_parallel_frames
 from .provenance import write_manifest
-from .restorer import OptionalFaceRestorer
+from .restorer import build_face_restorer
 from .tracking import TemporalFaceTracker
 from .videoio import RawFFmpegWriter, mux_original_audio, open_video_reader
 
@@ -29,7 +28,15 @@ def run_pipeline(
     output_video: Path,
     manifest_dir: Path,
     config,
+    *,
+    model_bundle: ModelBundle | None = None,
 ) -> tuple[Path, Path]:
+    """Orquesta el caso de uso dependiendo solo de contratos de alto nivel.
+
+    ``model_bundle`` permite inyectar otro backend o dobles de prueba. La CLI usa la
+    fábrica registrada según ``engine.backend``.
+    """
+
     for required in (input_video, target_reference, swapper_model):
         if not required.is_file():
             raise FileNotFoundError(required)
@@ -38,15 +45,18 @@ def run_pipeline(
     output_video.parent.mkdir(parents=True, exist_ok=True)
     manifest_dir.mkdir(parents=True, exist_ok=True)
 
-    face_app, swapper, providers = initialize_models(config.engine, swapper_model)
+    models = model_bundle or initialize_models(config, swapper_model)
+    analyzer = models.analyzer
     source_face, source_paths = build_source_identity(
-        face_app,
+        analyzer,
         source_dir,
         config.identity.source_min_score,
         config.identity.max_source_images,
     )
     target_embedding = load_reference_embedding(
-        face_app, target_reference, config.identity.source_min_score
+        analyzer,
+        target_reference,
+        config.identity.source_min_score,
     )
     tracker = TemporalFaceTracker(
         target_embedding,
@@ -60,13 +70,7 @@ def run_pipeline(
         flow_max_error=config.tracking.flow_max_error,
     )
     blender = ProfessionalBlender(**config.blend.__dict__)
-    restorer = OptionalFaceRestorer(
-        config.restorer.enabled,
-        config.restorer.model_path,
-        config.restorer.input_size,
-        config.restorer.output_range,
-        providers,
-    )
+    restorer = build_face_restorer(config.restorer, models.providers)
 
     reader = open_video_reader(input_video, config.performance)
     metadata = reader.metadata
@@ -76,7 +80,8 @@ def run_pipeline(
 
     console.print(
         "[cyan]Pipeline:[/cyan] "
-        f"decoder={reader.backend}, detección cada {config.tracking.detection_interval} frames, "
+        f"backend={models.backend}, decoder={reader.backend}, "
+        f"detección cada {config.tracking.detection_interval} frames, "
         f"blend ROI={'sí' if config.blend.roi_enabled else 'no'}"
     )
 
@@ -97,8 +102,8 @@ def run_pipeline(
             stats, pipeline_settings = run_parallel_frames(
                 reader=reader,
                 writer=writer,
-                face_app=face_app,
-                swapper=swapper,
+                analyzer=models.analyzer,
+                swapper=models.swapper,
                 source_face=source_face,
                 tracker=tracker,
                 blender=blender,
@@ -119,10 +124,9 @@ def run_pipeline(
     effective_fps = stats_dict.get("written_frames", 0) / max(elapsed, 1e-9)
     runtime = {
         "python": platform.python_version(),
-        "insightface": getattr(insightface, "__version__", "unknown"),
-        "onnxruntime": ort.__version__,
-        "providers_requested": providers,
-        "providers_available": ort.get_available_providers(),
+        "model_backend": models.backend,
+        "model_runtime": dict(models.runtime),
+        "providers_requested": list(models.providers),
         "decoder_backend": reader.backend,
         "encoder_codec": writer.used_codec,
         "fps": metadata.fps,

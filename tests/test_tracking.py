@@ -1,13 +1,7 @@
 import numpy as np
 
+from faceswap_pro.modeling import FaceData
 from faceswap_pro.tracking import TemporalFaceTracker
-
-
-class DummyFace(dict):
-    __getattr__ = dict.__getitem__
-    __setattr__ = dict.__setitem__
-    __getstate__ = None
-    __setstate__ = None
 
 
 def test_tracker_returns_safe_face_clone():
@@ -19,16 +13,14 @@ def test_tracker_returns_safe_face_clone():
         max_missing_frames=3,
         scene_cut_threshold=0.9,
     )
-    face = DummyFace(
-        {
-            "bbox": np.array([10, 10, 50, 50], dtype=np.float32),
-            "kps": np.array(
-                [[20, 20], [40, 20], [30, 30], [22, 42], [38, 42]],
-                dtype=np.float32,
-            ),
-            "embedding": reference.copy(),
-            "det_score": 0.99,
-        }
+    face = FaceData(
+        bbox=np.array([10, 10, 50, 50], dtype=np.float32),
+        kps=np.array(
+            [[20, 20], [40, 20], [30, 30], [22, 42], [38, 42]],
+            dtype=np.float32,
+        ),
+        embedding=reference.copy(),
+        det_score=0.99,
     )
     frame = np.zeros((80, 80, 3), dtype=np.uint8)
 
@@ -57,13 +49,11 @@ def test_tracker_propagates_landmarks_with_optical_flow():
     kps = np.array(
         [[25, 25], [45, 25], [35, 35], [27, 47], [43, 47]], dtype=np.float32
     )
-    face = DummyFace(
-        {
-            "bbox": np.array([18, 18, 52, 55], dtype=np.float32),
-            "kps": kps.copy(),
-            "embedding": reference.copy(),
-            "det_score": 0.99,
-        }
+    face = FaceData(
+        bbox=np.array([18, 18, 52, 55], dtype=np.float32),
+        kps=kps.copy(),
+        embedding=reference.copy(),
+        det_score=0.99,
     )
     frame1 = np.zeros((80, 80, 3), dtype=np.uint8)
     for x, y in kps.astype(int):

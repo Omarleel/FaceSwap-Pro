@@ -25,7 +25,12 @@ FaceSwap-Pro/
 │   ├── max_speed.yaml
 │   └── quality.yaml
 ├── scripts/
+├── docs/
+│   └── model_backends.md
 ├── src/
+│   └── faceswap_pro/
+│       ├── modeling.py              # contratos y registro de backends
+│       └── insightface_backend.py   # adaptador predeterminado
 └── tests/
 ```
 
@@ -176,6 +181,39 @@ FFmpeg/NVENC → outputs/videos
                    ↓
 manifiesto y métricas → outputs/manifests
 ```
+
+## Arquitectura SOLID y cambio de modelo
+
+El flujo principal ya no depende directamente de InsightFace. La creación del modelo
+se concentra en una fábrica y el pipeline recibe un `ModelBundle` compuesto por dos
+interfaces pequeñas:
+
+- `FaceAnalyzer`: detección y reconocimiento convertidos a `FaceData`;
+- `FaceSwapper`: generación del recorte y su transformación mediante `SwapResult`.
+
+La implementación actual vive en `insightface_backend.py`. Para usar otro framework o
+modelo, crea un adaptador, regístralo con `register_model_backend(...)` y selecciónalo
+en el perfil:
+
+```yaml
+engine:
+  backend: my_backend
+  plugins:
+    - my_backend
+  options:
+    provider: CUDA
+```
+
+El archivo del modelo puede indicarse con cualquiera de estos aliases:
+
+```powershell
+faceswap-pro run --model ".\models\my_model.onnx"
+faceswap-pro run --swapper-model ".\models\my_model.onnx"
+```
+
+Consulta [`docs/model_backends.md`](docs/model_backends.md) para ver un adaptador
+completo. El pipeline, el tracking, la identidad y el blend no necesitan cambios al
+añadir un backend nuevo.
 
 El manifiesto registra hashes SHA-256 de las entradas y del modelo, proveedores ONNX Runtime, backend de decodificación, codec de salida, FPS efectivo y estadísticas por etapa.
 

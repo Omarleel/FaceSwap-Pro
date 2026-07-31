@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from faceswap_pro.blend import ProfessionalBlender
+from faceswap_pro.modeling import DetectionStats, FaceData, SwapResult
 from faceswap_pro.parallel_pipeline import run_parallel_frames
 from faceswap_pro.tracking import TemporalFaceTracker
 from faceswap_pro.videoio import VideoMetadata
@@ -40,36 +41,34 @@ class DummyWriter:
         self.frames.append(frame.copy())
 
 
-class DummyDetector:
-    def detect(self, frame, max_num=0, metric="default"):
-        bbox = np.array([[22, 22, 58, 62, 0.99]], dtype=np.float32)
-        kps = np.array(
-            [[[30, 32], [49, 32], [40, 42], [32, 54], [48, 54]]],
-            dtype=np.float32,
+class DummyAnalyzer:
+    def find_faces(self, image):
+        return []
+
+    def analyze(self, frame, previous_bbox, full_scan):
+        face = FaceData(
+            bbox=np.array([22, 22, 58, 62], dtype=np.float32),
+            kps=np.array(
+                [[30, 32], [49, 32], [40, 42], [32, 54], [48, 54]],
+                dtype=np.float32,
+            ),
+            det_score=0.99,
+            embedding=np.array([1.0, 0.0], dtype=np.float32),
         )
-        return bbox, kps
-
-
-class DummyRecognizer:
-    def get(self, frame, face):
-        face.embedding = np.array([1.0, 0.0], dtype=np.float32)
-
-
-class DummyFaceApp:
-    def __init__(self):
-        self.det_model = DummyDetector()
-        self.models = {"recognition": DummyRecognizer()}
+        return [face], DetectionStats(detected=1, recognized=1, full_scan=full_scan)
 
 
 class DummySwapper:
-    def get(self, frame, target_face, source_face, paste_back=False):
+    def swap(self, frame, target_face, source_face):
         fake = np.full((16, 16, 3), 200, dtype=np.uint8)
         affine = np.array([[0.4, 0, -8], [0, 0.4, -8]], dtype=np.float32)
-        return fake, affine
+        return SwapResult(crop=fake, affine=affine)
 
 
 class IdentityRestorer:
-    def __call__(self, image):
+    enabled = False
+
+    def restore(self, image):
         return image
 
 
@@ -117,7 +116,7 @@ def test_parallel_pipeline_preserves_order_and_processes_all_frames():
     stats, settings = run_parallel_frames(
         reader=reader,
         writer=writer,
-        face_app=DummyFaceApp(),
+        analyzer=DummyAnalyzer(),
         swapper=DummySwapper(),
         source_face=object(),
         tracker=tracker,

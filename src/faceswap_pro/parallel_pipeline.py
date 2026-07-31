@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
-from .fast_analysis import SelectiveFaceAnalyzer
+from .modeling import FaceAnalyzer, FaceData, FaceRestorer, FaceSwapper
 from .provenance import add_disclosure
 
 _SENTINEL = object()
@@ -28,7 +28,7 @@ class FramePacket:
 class AnalyzedPacket:
     index: int
     frame: np.ndarray
-    target_face: Any | None
+    target_face: FaceData | None
 
 
 @dataclass(frozen=True)
@@ -135,7 +135,7 @@ def _analysis_worker(
     stop: threading.Event,
     errors: queue.Queue,
     stats: PipelineStats,
-    analyzer: SelectiveFaceAnalyzer,
+    analyzer: FaceAnalyzer,
     tracker,
     tracking_config,
 ) -> None:
@@ -265,23 +265,18 @@ def run_parallel_frames(
     *,
     reader,
     writer,
-    face_app,
-    swapper,
+    analyzer: FaceAnalyzer,
+    swapper: FaceSwapper,
     source_face,
     tracker,
     blender,
-    restorer,
+    restorer: FaceRestorer,
     config,
 ) -> tuple[PipelineStats, dict[str, Any]]:
-    workers, cv_threads = resolve_parallelism(config.performance, config.restorer.enabled)
+    workers, cv_threads = resolve_parallelism(config.performance, restorer.enabled)
     cv2.setUseOptimized(True)
     cv2.setNumThreads(cv_threads)
 
-    analyzer = SelectiveFaceAnalyzer(
-        face_app,
-        max_faces=config.engine.max_faces,
-        max_recognition_candidates=config.tracking.max_recognition_candidates,
-    )
     read_queue: queue.Queue = queue.Queue(maxsize=config.performance.reader_queue)
     analysis_queue: queue.Queue = queue.Queue(maxsize=config.performance.analysis_queue)
     write_queue: queue.Queue = queue.Queue(maxsize=config.performance.writer_queue)
@@ -360,12 +355,12 @@ def run_parallel_frames(
             affine = None
             if packet.target_face is not None:
                 swap_started = time.perf_counter()
-                fake_crop, affine = swapper.get(
+                swap_result = swapper.swap(
                     packet.frame,
                     packet.target_face,
                     source_face,
-                    paste_back=False,
                 )
+                fake_crop, affine = swap_result.crop, swap_result.affine
                 stats.add(swap_seconds=time.perf_counter() - swap_started)
 
             pending[packet.index] = executor.submit(

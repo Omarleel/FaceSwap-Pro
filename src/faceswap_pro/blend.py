@@ -91,7 +91,7 @@ class ProfessionalBlender:
             (self.aligned_size, self.aligned_size),
             interpolation=self.interpolation,
         )
-        fake = restorer(fake)
+        fake = restorer.restore(fake)
         mask = self._cached_mask
         fake = self._color_match(fake, aligned_target, mask)
         fake = self._detail(fake)

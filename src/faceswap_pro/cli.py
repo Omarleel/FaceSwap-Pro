@@ -5,13 +5,16 @@ import os
 import platform
 from pathlib import Path
 
-import onnxruntime as ort
 import typer
 from rich.console import Console
 from rich.panel import Panel
 
 from .config import load_config
-from .engine import preload_gpu_runtime
+from .engine import (
+    available_model_backends,
+    preload_gpu_runtime,
+    register_builtin_model_backends,
+)
 from .paths import (
     DEFAULT_CONFIG,
     DEFAULT_INPUT_VIDEO,
@@ -75,11 +78,12 @@ def run(
     ),
     swapper_model: Path = typer.Option(
         DEFAULT_SWAPPER_MODEL,
+        "--model",
         "--swapper-model",
         exists=True,
         file_okay=True,
         dir_okay=False,
-        help="Modelo INSwapper ONNX.",
+        help="Archivo del modelo principal seleccionado por engine.backend.",
     ),
     output_video: Path | None = typer.Option(
         None,
@@ -126,12 +130,19 @@ def run(
 @app.command()
 def doctor() -> None:
     """Comprueba CUDA EP, FFmpeg, NVDEC y NVENC antes de procesar."""
+    try:
+        import onnxruntime as ort
+    except ModuleNotFoundError as exc:
+        console.print("[red]ONNX Runtime no está instalado en este entorno.[/red]")
+        raise typer.Exit(code=2) from exc
     preload_gpu_runtime()
+    register_builtin_model_backends()
     ffmpeg_path = select_ffmpeg("h264_nvenc")
     ffmpeg = str(ffmpeg_path) if ffmpeg_path else None
     nvenc = bool(ffmpeg_path and ffmpeg_has_encoder(ffmpeg_path, "h264_nvenc"))
     report = {
         "project": "FaceSwap-Pro",
+        "model_backends": list(available_model_backends()),
         "python": platform.python_version(),
         "onnxruntime": ort.__version__,
         "providers": ort.get_available_providers(),

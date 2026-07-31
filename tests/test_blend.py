@@ -4,7 +4,7 @@ from faceswap_pro.blend import ProfessionalBlender
 
 
 class IdentityRestorer:
-    def __call__(self, image):
+    def restore(self, image):
         return image
 
 
@@ -31,7 +31,7 @@ def test_roi_blend_does_not_modify_distant_pixels():
 
 def test_roi_and_full_frame_blend_are_equivalent():
     class Restorer:
-        def __call__(self, image):
+        def restore(self, image):
             return image
 
     rng = np.random.default_rng(7)

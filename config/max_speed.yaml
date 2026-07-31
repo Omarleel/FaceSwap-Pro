@@ -1,4 +1,7 @@
 engine:
+  backend: insightface_inswapper
+  options: {}
+  plugins: []
   model_pack: buffalo_l
   det_size: [512, 512]
   det_thresh: 0.55

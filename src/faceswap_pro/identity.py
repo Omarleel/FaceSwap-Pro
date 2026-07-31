@@ -6,8 +6,8 @@ import cv2
 import numpy as np
 from rich.console import Console
 
-from .face_utils import clone_face
 from .math_utils import bbox_area, l2_normalize
+from .modeling import FaceAnalyzer, FaceData
 
 console = Console()
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -30,7 +30,11 @@ def _best_face(faces, image_shape):
         x1, y1, x2, y2 = face.bbox
         fx, fy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
         center_penalty = np.hypot((fx - cx) / max(w, 1), (fy - cy) / max(h, 1))
-        return bbox_area(face.bbox) * float(face.det_score or 0.0) * (1.0 - min(center_penalty, 0.8))
+        return (
+            bbox_area(face.bbox)
+            * float(face.det_score or 0.0)
+            * (1.0 - min(center_penalty, 0.8))
+        )
 
     return max(faces, key=score)
 
@@ -43,7 +47,9 @@ def _pose_weight(face) -> float:
     return max(0.20, float(np.exp(-(abs(pitch) + abs(yaw)) / 70.0)))
 
 
-def build_source_identity(face_app, source_dir: Path, min_score: float, limit: int):
+def build_source_identity(
+    analyzer: FaceAnalyzer, source_dir: Path, min_score: float, limit: int
+) -> tuple[FaceData, list[Path]]:
     paths = list_source_images(source_dir, limit)
     selected_faces = []
     embeddings = []
@@ -55,7 +61,11 @@ def build_source_identity(face_app, source_dir: Path, min_score: float, limit: i
         if image is None:
             console.print(f"[yellow]Omitida (no se pudo leer):[/yellow] {path}")
             continue
-        faces = [f for f in face_app.get(image) if float(f.det_score or 0.0) >= min_score]
+        faces = [
+        face
+        for face in analyzer.find_faces(image)
+        if float(face.det_score or 0.0) >= min_score
+    ]
         if not faces:
             console.print(f"[yellow]Sin rostro fiable:[/yellow] {path}")
             continue
@@ -84,17 +94,23 @@ def build_source_identity(face_app, source_dir: Path, min_score: float, limit: i
 
     best_face = selected_faces[int(np.argmax(weights))]
 
-    source_face = clone_face(best_face)
+    source_face = best_face.clone()
     source_face.embedding = mean_embedding.astype(np.float32)
 
     return source_face, valid_paths
 
 
-def load_reference_embedding(face_app, path: Path, min_score: float) -> np.ndarray:
+def load_reference_embedding(
+    analyzer: FaceAnalyzer, path: Path, min_score: float
+) -> np.ndarray:
     image = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError(f"No se pudo leer la referencia del sujeto objetivo: {path}")
-    faces = [f for f in face_app.get(image) if float(f.det_score or 0.0) >= min_score]
+    faces = [
+        face
+        for face in analyzer.find_faces(image)
+        if float(face.det_score or 0.0) >= min_score
+    ]
     if not faces:
         raise ValueError("No se detectó un rostro fiable en la referencia del sujeto objetivo.")
     return l2_normalize(_best_face(faces, image.shape).embedding)

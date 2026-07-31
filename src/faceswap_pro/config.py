@@ -9,6 +9,7 @@ import yaml
 
 @dataclass(frozen=True)
 class EngineConfig:
+    backend: str
     model_pack: str
     det_size: tuple[int, int]
     det_thresh: float
@@ -16,6 +17,8 @@ class EngineConfig:
     cuda: dict[str, Any]
     allowed_modules: tuple[str, ...]
     max_faces: int
+    options: dict[str, Any]
+    plugins: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -116,10 +119,17 @@ def load_config(path: Path) -> AppConfig:
     encoding = raw["encoding"]
     performance = raw.get("performance", {})
 
+    backend = str(engine.get("backend", "insightface_inswapper")).strip().lower()
+    if not backend:
+        raise ValueError("engine.backend no puede estar vacío.")
+
     allowed_modules = tuple(
         str(value) for value in engine.get("allowed_modules", ["detection", "recognition"])
     )
-    if "detection" not in allowed_modules or "recognition" not in allowed_modules:
+    if (
+        backend == "insightface_inswapper"
+        and ("detection" not in allowed_modules or "recognition" not in allowed_modules)
+    ):
         raise ValueError(
             "engine.allowed_modules debe incluir detection y recognition para INSwapper."
         )
@@ -136,13 +146,16 @@ def load_config(path: Path) -> AppConfig:
 
     return AppConfig(
         engine=EngineConfig(
-            model_pack=str(engine["model_pack"]),
-            det_size=tuple(int(x) for x in engine["det_size"]),
-            det_thresh=float(engine["det_thresh"]),
-            providers=list(engine["providers"]),
+            backend=backend,
+            model_pack=str(engine.get("model_pack", "")),
+            det_size=tuple(int(x) for x in engine.get("det_size", [640, 640])),
+            det_thresh=float(engine.get("det_thresh", 0.5)),
+            providers=list(engine.get("providers", ["CPUExecutionProvider"])),
             cuda=dict(engine.get("cuda", {})),
             allowed_modules=allowed_modules,
             max_faces=_positive_int(engine.get("max_faces", 10), 10),
+            options=dict(engine.get("options", {})),
+            plugins=tuple(str(value) for value in engine.get("plugins", [])),
         ),
         identity=IdentityConfig(
             source_min_score=float(identity["source_min_score"]),

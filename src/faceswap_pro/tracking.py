@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 import cv2
 import numpy as np
 
-from .face_utils import clone_face
 from .math_utils import bbox_iou, cosine_similarity
+from .modeling import FaceData
 
 
 @dataclass
@@ -15,7 +14,7 @@ class TrackState:
     bbox: np.ndarray
     kps: np.ndarray
     embedding: np.ndarray
-    face_template: Any
+    face_template: FaceData
     missing: int = 0
 
 
@@ -118,14 +117,14 @@ class TemporalFaceTracker:
             smooth_bbox = alpha * self.state.bbox + (1.0 - alpha) * best_bbox
             smooth_kps = alpha * self.state.kps + (1.0 - alpha) * best_kps
 
-        result = clone_face(best)
+        result = best.clone()
         result.bbox = smooth_bbox.astype(np.float32)
         result.kps = smooth_kps.astype(np.float32)
         self.state = TrackState(
             bbox=result.bbox.copy(),
             kps=result.kps.copy(),
             embedding=np.asarray(best.embedding, dtype=np.float32).copy(),
-            face_template=clone_face(result),
+            face_template=result.clone(),
             missing=0,
         )
         self.previous_gray = gray
@@ -213,7 +212,7 @@ class TemporalFaceTracker:
         self.state.missing = 0
         self.previous_gray = gray
 
-        result = clone_face(self.state.face_template)
+        result = self.state.face_template.clone()
         result.bbox = self.state.bbox.copy()
         result.kps = self.state.kps.copy()
         return result

@@ -22,3 +22,4 @@ outputs/manifests/*
 !outputs/manifests/.gitkeep
 *.mp4
 *.jpg
+*.zip

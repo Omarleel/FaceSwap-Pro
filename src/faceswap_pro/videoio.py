@@ -265,7 +265,9 @@ class RawFFmpegWriter:
             raise RuntimeError(f"FFmpeg terminó con código {code} usando {self.used_codec}.")
 
 
-def mux_original_audio(silent_video: Path, source_video: Path, output: Path, audio_bitrate: str) -> None:
+def mux_original_audio(
+    silent_video: Path, source_video: Path, output: Path, audio_bitrate: str
+) -> None:
     ffmpeg = select_ffmpeg()
     if ffmpeg is None:
         raise RuntimeError("FFmpeg no está disponible para multiplexar el audio.")
