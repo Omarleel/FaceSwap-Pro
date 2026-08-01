@@ -9,11 +9,36 @@ import numpy as np
 
 
 @dataclass
+class FaceGeometry:
+    """Geometría facial densa independiente del framework que la produjo."""
+
+    landmarks: np.ndarray
+    pose: np.ndarray | None = None
+    transformation: np.ndarray | None = None
+    blendshapes: Mapping[str, float] = field(default_factory=dict)
+    confidence: float = 0.0
+
+    def clone(self) -> FaceGeometry:
+        return FaceGeometry(
+            landmarks=np.asarray(self.landmarks, dtype=np.float32).copy(),
+            pose=None if self.pose is None else np.asarray(self.pose, dtype=np.float32).copy(),
+            transformation=(
+                None
+                if self.transformation is None
+                else np.asarray(self.transformation, dtype=np.float32).copy()
+            ),
+            blendshapes=dict(self.blendshapes),
+            confidence=float(self.confidence),
+        )
+
+
+@dataclass
 class FaceData:
     """Representación neutral de un rostro usada por el dominio.
 
-    Los adaptadores pueden conservar el objeto del framework en ``native``; el resto
-    de la aplicación solo utiliza estos campos y no depende de InsightFace.
+    ``reference_image`` se utiliza únicamente cuando un generador necesita la imagen
+    de identidad completa (por ejemplo HifiFace). Los backends basados solo en
+    embeddings pueden ignorarla.
     """
 
     bbox: np.ndarray
@@ -21,6 +46,8 @@ class FaceData:
     det_score: float = 0.0
     embedding: np.ndarray | None = None
     pose: np.ndarray | None = None
+    geometry: FaceGeometry | None = None
+    reference_image: np.ndarray | None = field(default=None, repr=False, compare=False)
     native: Any | None = field(default=None, repr=False, compare=False)
 
     def clone(self) -> FaceData:
@@ -34,6 +61,12 @@ class FaceData:
                 else np.asarray(self.embedding, dtype=np.float32).copy()
             ),
             pose=None if self.pose is None else np.asarray(self.pose, dtype=np.float32).copy(),
+            geometry=None if self.geometry is None else self.geometry.clone(),
+            reference_image=(
+                None
+                if self.reference_image is None
+                else np.asarray(self.reference_image).copy()
+            ),
             native=self.native,
         )
 
@@ -49,6 +82,29 @@ class DetectionStats:
 class SwapResult:
     crop: np.ndarray
     affine: np.ndarray
+    mask: np.ndarray | None = None
+    opacity: float = 1.0
+    mask_mode: str = "multiply"
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ModelCapabilities:
+    """Descripción verificable del modelo, evitando nombres de marketing ambiguos."""
+
+    generator: str = "unknown"
+    native_output_size: int | None = None
+    geometry_conditioning: str = "none"
+    geometry_postprocess: str = "none"
+    temporal_generation: str = "frame_independent"
+
+    @property
+    def truly_3d_aware(self) -> bool:
+        return self.geometry_conditioning in {
+            "3dmm_internal",
+            "flame_internal",
+            "gaussian_3d_internal",
+        }
 
 
 @runtime_checkable
@@ -65,6 +121,17 @@ class FaceAnalyzer(Protocol):
         full_scan: bool,
     ) -> tuple[list[FaceData], DetectionStats]:
         """Analiza un frame del video aplicando la estrategia propia del backend."""
+
+
+@runtime_checkable
+class FaceGeometryEstimator(Protocol):
+    """Obtiene malla 3D, pose y expresión sin imponer un framework concreto."""
+
+    def estimate(
+        self,
+        image: np.ndarray,
+        bbox: np.ndarray | None = None,
+    ) -> FaceGeometry | None: ...
 
 
 @runtime_checkable
@@ -92,13 +159,15 @@ class FaceRestorer(Protocol):
 
 @dataclass(frozen=True)
 class ModelBundle:
-    """Servicios de modelo construidos por un backend concreto."""
+    """Servicios y metadatos construidos por un backend concreto."""
 
     backend: str
     analyzer: FaceAnalyzer
     swapper: FaceSwapper
     providers: tuple[Any, ...] = ()
     runtime: Mapping[str, Any] = field(default_factory=dict)
+    capabilities: ModelCapabilities = field(default_factory=ModelCapabilities)
+    model_artifacts: tuple[Path, ...] = ()
 
 
 class ModelBackendFactory(Protocol):

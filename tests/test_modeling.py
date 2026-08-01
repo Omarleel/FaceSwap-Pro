@@ -91,3 +91,47 @@ def test_backend_plugin_is_loaded_from_configured_module(tmp_path, monkeypatch):
     bundle = create_model_bundle("filesystem_backend", config, Path("model.bin"))
 
     assert bundle.backend == "filesystem_backend"
+
+
+def test_model_capabilities_distinguish_internal_3d_from_mesh_postprocess():
+    from faceswap_pro.modeling import ModelCapabilities
+
+    mesh = ModelCapabilities(
+        generator="inswapper_128",
+        geometry_conditioning="none",
+        geometry_postprocess="mediapipe_mesh_warp",
+    )
+    hififace = ModelCapabilities(
+        generator="hififace",
+        geometry_conditioning="3dmm_internal",
+        geometry_postprocess="learned_semantic_mask",
+    )
+
+    assert mesh.truly_3d_aware is False
+    assert hififace.truly_3d_aware is True
+
+
+def test_face_data_clone_copies_reference_image():
+    image = np.zeros((8, 8, 3), dtype=np.uint8)
+    face = FaceData(
+        bbox=np.array([0, 0, 7, 7], dtype=np.float32),
+        kps=np.ones((5, 2), dtype=np.float32),
+        reference_image=image,
+    )
+
+    clone = face.clone()
+    clone.reference_image[0, 0] = 255
+
+    assert image[0, 0].max() == 0
+
+
+def test_builtin_registry_exposes_precise_and_legacy_names():
+    from faceswap_pro.engine import register_builtin_model_backends
+
+    register_builtin_model_backends()
+    backends = set(available_model_backends())
+
+    assert "insightface_inswapper" in backends
+    assert "insightface_inswapper_mediapipe_mesh" in backends
+    assert "hififace_3dmm" in backends
+    assert "mediapipe_3d_hybrid" in backends

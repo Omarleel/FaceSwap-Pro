@@ -24,9 +24,17 @@ def _load_onnxruntime():
 
 
 def preload_gpu_runtime() -> None:
+    # ONNX Runtime recomienda importar PyTorch primero cuando ambos frameworks
+    # comparten CUDA/cuDNN. Así ORT reutiliza las DLL de la build de PyTorch en
+    # lugar de precargar otra familia de CUDA desde site-packages.
+    try:
+        import torch  # noqa: F401
+    except Exception:
+        pass
+
     ort = _load_onnxruntime()
     try:
-        ort.preload_dlls(directory="")
+        ort.preload_dlls()
     except Exception:
         # En Linux o con CUDA instalada en el sistema puede no ser necesario.
         pass
@@ -58,9 +66,21 @@ def register_builtin_model_backends() -> None:
     global _BUILTINS_REGISTERED
     if _BUILTINS_REGISTERED:
         return
-    from .insightface_backend import BACKEND_NAME, InsightFaceBackendFactory
+    from .hififace_backend import BACKEND_NAME as HIFIFACE_BACKEND_NAME
+    from .hififace_backend import HifiFace3DMMBackendFactory
+    from .insightface_backend import BACKEND_NAME as INSWAPPER_BACKEND_NAME
+    from .insightface_backend import InsightFaceBackendFactory
+    from .mesh_assisted_backend import (
+        BACKEND_NAME as MESH_BACKEND_NAME,
+        LEGACY_BACKEND_NAME,
+        LegacyMediaPipe3DHybridBackendFactory,
+        MediaPipeMeshAssistedBackendFactory,
+    )
 
-    register_model_backend(BACKEND_NAME, InsightFaceBackendFactory())
+    register_model_backend(INSWAPPER_BACKEND_NAME, InsightFaceBackendFactory())
+    register_model_backend(MESH_BACKEND_NAME, MediaPipeMeshAssistedBackendFactory())
+    register_model_backend(LEGACY_BACKEND_NAME, LegacyMediaPipe3DHybridBackendFactory())
+    register_model_backend(HIFIFACE_BACKEND_NAME, HifiFace3DMMBackendFactory())
     _BUILTINS_REGISTERED = True
 
 

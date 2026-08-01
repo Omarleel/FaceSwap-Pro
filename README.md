@@ -1,233 +1,184 @@
-# FaceSwap-Pro 0.1.0
+# FaceSwap-Pro
 
-Pipeline local de reemplazo facial optimizado para GPU NVIDIA. Incluye detección y reconocimiento con InsightFace, tracking temporal, flujo óptico, composición por ROI, decodificación NVDEC, codificación NVENC, audio original, métricas y etiqueta visible `CONTENIDO SINTÉTICO · IA`.
+Pipeline local y modular de reemplazo facial con GPU NVIDIA. Mantiene el flujo
+INSwapper existente y añade un generador **condicionado internamente por 3DMM**.
+Cada salida conserva la etiqueta visible `CONTENIDO SINTÉTICO · IA` y un manifiesto
+con hashes de entradas y modelos.
 
-## Estructura del proyecto
+## Backends incluidos
+
+| Backend | Generador | Geometría | Estado |
+|---|---|---|---|
+| `insightface_inswapper` | INSwapper 128 | Ninguna dentro del generador | Compatible y rápido |
+| `insightface_inswapper_mediapipe_mesh` | INSwapper 128 | Postproceso por malla MediaPipe | Compatible, no 3D-aware generativo |
+| `hififace_3dmm` | HifiFace 256 | Identidad condicionada por 3DMM dentro del generador | 3DMM-aware real |
+
+El alias histórico `mediapipe_3d_hybrid` permanece para no romper YAML antiguos,
+pero emite una advertencia de obsolescencia. El nombre era impreciso porque MediaPipe
+solo deformaba la salida 2D después de generarla.
+
+## Arquitectura
 
 ```text
-FaceSwap-Pro/
-├── inputs/
-│   ├── videos/
-│   │   └── input.mp4
-│   ├── source_faces/
-│   │   ├── frente.jpg
-│   │   ├── tres_cuartos.jpg
-│   │   └── perfil.jpg
-│   └── target_faces/
-│       └── target.jpg
-├── models/
-│   ├── inswapper_128.onnx
-│   └── face_restorer.onnx       # opcional
-├── outputs/
-│   ├── videos/
-│   └── manifests/
-├── config/
-│   ├── max_speed.yaml
-│   └── quality.yaml
-├── scripts/
-├── docs/
-│   └── model_backends.md
-├── src/
-│   └── faceswap_pro/
-│       ├── modeling.py              # contratos y registro de backends
-│       └── insightface_backend.py   # adaptador predeterminado
-└── tests/
+FaceAnalyzer ───────────────┐
+                           ├─► tracking y selección de identidad
+FaceGenerator / FaceSwapper┘
+        │
+        ├─ INSwapper 128
+        ├─ INSwapper + postproceso por malla
+        └─ HifiFace + extractor 3DMM + Semantic Facial Fusion
+                                      │
+                                      ▼
+                      máscara aprendida / composición ROI
+                                      │
+                                      ▼
+                              NVENC + manifiesto
 ```
 
-## Instalación automática en Windows con Conda
+Las capacidades del modelo se declaran mediante `ModelCapabilities`:
 
-Requisitos:
+- `geometry_conditioning`: geometría usada dentro del generador;
+- `geometry_postprocess`: corrección aplicada después de generar;
+- `truly_3d_aware`: verdadero únicamente para condicionamiento interno conocido.
 
-- Windows 11 de 64 bits;
-- Anaconda o Miniconda;
-- controlador NVIDIA actualizado;
-- WinGet/App Installer.
+## Instalación base
 
-Desde PowerShell, en la carpeta del proyecto:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\setup_windows.ps1
-```
-
-Para reconstruir completamente el entorno:
+El entorno existente con ONNX Runtime GPU continúa funcionando. Instala el proyecto:
 
 ```powershell
-conda deactivate
-powershell -ExecutionPolicy Bypass -File .\scripts\setup_windows.ps1 -Recreate
-```
-
-Después:
-
-```powershell
-conda activate FaceSwap-Pro
+python -m pip install -e .
 faceswap-pro doctor
 ```
 
-El diagnóstico esperado incluye:
-
-```json
-"cuda_provider_ok": true,
-"h264_nvenc": true,
-"cuda_hw_decode": true
-```
-
-## Preparar archivos
-
-Copia el video de entrada:
-
-```text
-inputs/videos/input.mp4
-```
-
-Copia las fotografías de la identidad que deseas insertar:
-
-```text
-inputs/source_faces/
-```
-
-Copia la referencia del sujeto objetivo del video:
-
-```text
-inputs/target_faces/target.jpg
-```
-
-Coloca el modelo:
-
-```text
-models/inswapper_128.onnx
-```
-
-También puedes crear o reparar la estructura mediante:
+Para el backend opcional por malla:
 
 ```powershell
-faceswap-pro init
+python -m pip install -e ".[mesh]"
 ```
+
+## Preparar HifiFace 3DMM
+
+La integración usa la implementación externa MIT `xuehy/HiFiFace-pytorch`. El código
+y los pesos no se redistribuyen dentro de este ZIP.
+
+1. Instala juntos una build CUDA de PyTorch y su `torchvision` compatible con tu controlador y GPU.
+2. Instala las dependencias de soporte:
+
+```powershell
+python -m pip install -e ".[hififace3d]"
+```
+
+3. Clona la implementación. En Windows no uses un `git clone` normal: el
+repositorio contiene `AdaptiveWingLoss/aux.py` y `AUX` es un nombre reservado
+por NTFS. El instalador `scripts/setup_windows.ps1` ya aplica automáticamente
+un checkout compatible. Para hacerlo manualmente:
+
+```powershell
+git clone --depth 1 --no-checkout `
+  https://github.com/xuehy/HiFiFace-pytorch.git `
+  .\third_party\HiFiFace-pytorch
+
+git -C .\third_party\HiFiFace-pytorch config core.protectNTFS false
+git -C .\third_party\HiFiFace-pytorch sparse-checkout set --no-cone `
+  "/*" "!/AdaptiveWingLoss/aux.py"
+git -C .\third_party\HiFiFace-pytorch checkout --force
+```
+
+4. Descarga desde las fuentes indicadas por esa implementación:
+
+```text
+models/hififace/
+├── standard_model/
+│   └── generator_80000.pth
+└── aux/
+    ├── Deep3DFaceRecon/epoch_20_new.pth
+    ├── arcface/ms1mv3_arcface_r100_fp16_backbone.pth
+    └── BFM/
+        ├── 01_MorphableModel.mat
+        ├── BFM_exp_idx.mat
+        ├── BFM_front_idx.mat
+        ├── BFM_model_front.mat
+        ├── Exp_Pca.bin
+        ├── facemodel_info.mat
+        ├── select_vertex_id.mat
+        ├── similarity_Lm3D_all.mat
+        └── std_exp.txt
+```
+
+BFM requiere obtener los archivos bajo sus propias condiciones. Usa únicamente
+checkpoints de una fuente confiable: los checkpoints PyTorch pueden contener datos
+serializados ejecutables.
+
+5. Valida todo el perfil antes de procesar:
+
+```powershell
+faceswap-pro doctor --config .\config\quality_3dmm.yaml
+```
+
+El bloque `hififace_3dmm.ready` debe ser `true`.
 
 ## Ejecutar
 
-Con las rutas predeterminadas:
+### Flujo actual, sin cambios
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_example.ps1
+faceswap-pro run --config .\config\quality.yaml
 ```
 
-O directamente:
+### INSwapper asistido por malla
 
 ```powershell
-faceswap-pro run
+faceswap-pro run --config .\config\quality_mesh_assisted.yaml
 ```
 
-La salida se genera automáticamente, por ejemplo:
-
-```text
-outputs/videos/input_faceswap_20260731_173500.mp4
-outputs/manifests/input_faceswap_20260731_173500.manifest.json
-```
-
-## Usar rutas personalizadas
+### Generación condicionada por 3DMM
 
 ```powershell
+faceswap-pro run --config .\config\quality_3dmm.yaml
+```
+
+`quality_3d.yaml` es un alias legible del perfil `quality_3dmm.yaml`.
+
+## Rutas personalizadas
+
+`--model-path` admite archivos o directorios:
+
+```powershell
+# Archivo ONNX
 faceswap-pro run `
-  --input "D:\Videos\escena.mp4" `
-  --source-dir "D:\Rostros\origen" `
-  --target-ref "D:\Rostros\objetivo.jpg" `
-  --swapper-model ".\models\inswapper_128.onnx" `
-  --config ".\config\max_speed.yaml"
-```
+  --model-path .\models\inswapper_128.onnx `
+  --config .\config\quality.yaml
 
-Para indicar una salida exacta:
-
-```powershell
+# Directorio de checkpoint HifiFace
 faceswap-pro run `
-  --output ".\outputs\videos\resultado_final.mp4"
+  --model-path .\models\hififace\standard_model `
+  --config .\config\quality_3dmm.yaml
 ```
 
-Para cambiar solo las carpetas de salida:
+Los alias antiguos `--model` y `--swapper-model` continúan disponibles.
+
+## Qué significa “3D-aware” en este proyecto
+
+`hififace_3dmm` no es un simple warper. El generador obtiene coeficientes de forma
+3DMM de source y target, conserva la identidad/forma del source y combina expresión
+y pose del target antes de sintetizar. Después, Semantic Facial Fusion predice una
+máscara y conserva iluminación, fondo y oclusiones dentro del propio modelo.
+
+Esto es **condicionamiento generativo por 3DMM**, no un avatar 3D explícito con rig,
+texturas editables o render físico. El perfil sigue siendo independiente por frame;
+la consistencia temporal neuronal queda como una extensión separada futura.
+
+## Pruebas
 
 ```powershell
-faceswap-pro run `
-  --output-dir ".\renders\videos" `
-  --manifest-dir ".\renders\metadata"
+pytest -q
 ```
 
-## Perfiles
+La suite cubre contratos, configuración, máscara aprendida, compatibilidad del flujo
+anterior, alineación HifiFace y el adaptador 3DMM mediante un runtime simulado.
 
-Máxima velocidad:
+## Uso responsable
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_example.ps1 `
-  -Config ".\config\max_speed.yaml"
-```
-
-Mayor calidad y seguimiento más frecuente:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_example.ps1 `
-  -Config ".\config\quality.yaml"
-```
-
-## Pipeline
-
-```text
-FFmpeg/NVDEC → cola de lectura
-                   ↓
-SCRFD + ArcFace + tracking
-                   ↓
-INSwapper en GPU
-                   ↓
-blend ROI + color + etiqueta en CPU paralelo
-                   ↓
-FFmpeg/NVENC → outputs/videos
-                   ↓
-manifiesto y métricas → outputs/manifests
-```
-
-## Arquitectura SOLID y cambio de modelo
-
-El flujo principal ya no depende directamente de InsightFace. La creación del modelo
-se concentra en una fábrica y el pipeline recibe un `ModelBundle` compuesto por dos
-interfaces pequeñas:
-
-- `FaceAnalyzer`: detección y reconocimiento convertidos a `FaceData`;
-- `FaceSwapper`: generación del recorte y su transformación mediante `SwapResult`.
-
-La implementación actual vive en `insightface_backend.py`. Para usar otro framework o
-modelo, crea un adaptador, regístralo con `register_model_backend(...)` y selecciónalo
-en el perfil:
-
-```yaml
-engine:
-  backend: my_backend
-  plugins:
-    - my_backend
-  options:
-    provider: CUDA
-```
-
-El archivo del modelo puede indicarse con cualquiera de estos aliases:
-
-```powershell
-faceswap-pro run --model ".\models\my_model.onnx"
-faceswap-pro run --swapper-model ".\models\my_model.onnx"
-```
-
-Consulta [`docs/model_backends.md`](docs/model_backends.md) para ver un adaptador
-completo. El pipeline, el tracking, la identidad y el blend no necesitan cambios al
-añadir un backend nuevo.
-
-El manifiesto registra hashes SHA-256 de las entradas y del modelo, proveedores ONNX Runtime, backend de decodificación, codec de salida, FPS efectivo y estadísticas por etapa.
-
-## Supervisión
-
-```powershell
-nvidia-smi `
-  --query-gpu=utilization.gpu,utilization.memory,memory.used,power.draw `
-  --format=csv `
-  -l 1
-```
-
-## Límites
-
-`inswapper_128.onnx` genera una cara de 128×128. El blend a mayor resolución mejora la integración, pero no crea detalle facial real que el modelo no haya generado. La velocidad depende de la resolución, el códec de entrada, el número de rostros y la frecuencia de redetección.
-
-Este proyecto no redistribuye modelos. Verifica las licencias correspondientes y utiliza material para el que tengas permiso, conservando la etiqueta visible de contenido sintético.
+Procesa únicamente material autorizado. Mantén la etiqueta visible y el manifiesto.
+Revisa por separado las licencias del código, los pesos, BFM, InsightFace y los datos
+con los que se entrenó cada modelo.

@@ -7,7 +7,13 @@ import numpy as np
 
 from .engine import build_providers, preload_gpu_runtime
 from .math_utils import bbox_area, bbox_iou
-from .modeling import DetectionStats, FaceData, ModelBundle, SwapResult
+from .modeling import (
+    DetectionStats,
+    FaceData,
+    ModelBundle,
+    ModelCapabilities,
+    SwapResult,
+)
 
 BACKEND_NAME = "insightface_inswapper"
 
@@ -200,53 +206,86 @@ class InsightFaceSwapper:
         )
 
 
+class InsightFaceAnalysisServices:
+    def __init__(self, analyzer, providers, runtime) -> None:
+        self.analyzer = analyzer
+        self.providers = providers
+        self.runtime = runtime
+
+
+def create_insightface_analysis_services(config: Any) -> InsightFaceAnalysisServices:
+    """Crea detección/reconocimiento sin imponer un generador concreto."""
+
+    engine_config = config.engine
+    import insightface
+    import onnxruntime as ort
+    from insightface.app import FaceAnalysis
+
+    preload_gpu_runtime()
+    providers = build_providers(engine_config)
+    face_app = FaceAnalysis(
+        name=engine_config.model_pack,
+        allowed_modules=list(engine_config.allowed_modules),
+        providers=providers,
+    )
+    face_app.prepare(
+        ctx_id=int(engine_config.cuda.get("device_id", 0)),
+        det_thresh=engine_config.det_thresh,
+        det_size=engine_config.det_size,
+    )
+    analyzer = InsightFaceAnalyzer(
+        face_app,
+        max_faces=engine_config.max_faces,
+        max_recognition_candidates=config.tracking.max_recognition_candidates,
+    )
+    return InsightFaceAnalysisServices(
+        analyzer=analyzer,
+        providers=tuple(providers),
+        runtime={
+            "insightface": getattr(insightface, "__version__", "unknown"),
+            "onnxruntime": ort.__version__,
+            "providers_available": ort.get_available_providers(),
+            "model_pack": engine_config.model_pack,
+        },
+    )
+
+
 class InsightFaceBackendFactory:
     def create(self, config: Any, model_path: Path) -> ModelBundle:
         engine_config = config.engine
         import insightface
-        import onnxruntime as ort
-        from insightface.app import FaceAnalysis
 
+        if not model_path.is_file():
+            raise FileNotFoundError(model_path)
         if "inswapper_128" in model_path.name.lower() and engine_config.model_pack != "buffalo_l":
             raise ValueError(
                 "inswapper_128 requiere embeddings del paquete buffalo_l; "
                 "restaura engine.model_pack: buffalo_l."
             )
 
-        preload_gpu_runtime()
-        providers = build_providers(engine_config)
-        face_app = FaceAnalysis(
-            name=engine_config.model_pack,
-            allowed_modules=list(engine_config.allowed_modules),
-            providers=providers,
-        )
-        face_app.prepare(
-            ctx_id=int(engine_config.cuda.get("device_id", 0)),
-            det_thresh=engine_config.det_thresh,
-            det_size=engine_config.det_size,
-        )
+        services = create_insightface_analysis_services(config)
         model = insightface.model_zoo.get_model(
             str(model_path),
             download=False,
-            providers=providers,
+            providers=list(services.providers),
         )
         if model is None:
             raise RuntimeError(f"No se pudo cargar el modelo swapper: {model_path}")
 
-        analyzer = InsightFaceAnalyzer(
-            face_app,
-            max_faces=engine_config.max_faces,
-            max_recognition_candidates=config.tracking.max_recognition_candidates,
-        )
+        runtime = dict(services.runtime)
+        runtime.update({"generator_model": str(model_path)})
         return ModelBundle(
             backend=BACKEND_NAME,
-            analyzer=analyzer,
+            analyzer=services.analyzer,
             swapper=InsightFaceSwapper(model),
-            providers=tuple(providers),
-            runtime={
-                "insightface": getattr(insightface, "__version__", "unknown"),
-                "onnxruntime": ort.__version__,
-                "providers_available": ort.get_available_providers(),
-                "model_pack": engine_config.model_pack,
-            },
+            providers=services.providers,
+            runtime=runtime,
+            capabilities=ModelCapabilities(
+                generator="inswapper_128",
+                native_output_size=128,
+                geometry_conditioning="none",
+                geometry_postprocess="none",
+                temporal_generation="frame_independent",
+            ),
+            model_artifacts=(model_path,),
         )

@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "FaceSwap-Pro"
-version = "0.1.0"
-description = "Pipeline local de reemplazo facial optimizado con InsightFace, tracking temporal, NVDEC/NVENC y procesamiento paralelo."
+version = "0.3.0"
+description = "Pipeline facial modular con INSwapper compatible, postproceso por malla y generación HifiFace condicionada por 3DMM."
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
 dependencies = [
   "insightface==1.0.1",
-  "onnxruntime-gpu[cuda,cudnn]==1.28.0",
+  "onnxruntime-gpu[cuda,cudnn]==1.26.0",
   "onnx>=1.18,<2",
   "opencv-python-headless>=4.10,<5",
   "numpy>=1.26,<3",
@@ -22,6 +22,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+mesh = [
+  "mediapipe>=0.10.35,<0.11",
+]
+# Alias temporal para instalaciones antiguas; el nombre correcto es ``mesh``.
+geometry3d = [
+  "mediapipe>=0.10.35,<0.11",
+]
+hififace3d = [
+  "kornia>=0.7,<1",
+  "loguru>=0.7,<1",
+]
 dev = [
   "pytest>=8.3,<10",
   "ruff>=0.9,<1",
@@ -39,3 +50,5 @@ target-version = "py311"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+testpaths = ["tests"]
+norecursedirs = ["third_party", ".git", ".venv", "build", "dist"]

@@ -86,11 +86,6 @@ class PerformanceConfig:
 
 
 @dataclass(frozen=True)
-class WatermarkConfig:
-    text: str
-
-
-@dataclass(frozen=True)
 class AppConfig:
     engine: EngineConfig
     identity: IdentityConfig
@@ -99,7 +94,6 @@ class AppConfig:
     restorer: RestorerConfig
     encoding: EncodingConfig
     performance: PerformanceConfig
-    watermark: WatermarkConfig
 
 
 def _positive_int(value: Any, default: int, minimum: int = 1) -> int:
@@ -126,12 +120,19 @@ def load_config(path: Path) -> AppConfig:
     allowed_modules = tuple(
         str(value) for value in engine.get("allowed_modules", ["detection", "recognition"])
     )
+    insightface_analysis_backends = {
+        "insightface_inswapper",
+        "insightface_inswapper_mediapipe_mesh",
+        "mediapipe_3d_hybrid",  # alias histórico
+        "hififace_3dmm",
+    }
     if (
-        backend == "insightface_inswapper"
+        backend in insightface_analysis_backends
         and ("detection" not in allowed_modules or "recognition" not in allowed_modules)
     ):
         raise ValueError(
-            "engine.allowed_modules debe incluir detection y recognition para INSwapper."
+            "engine.allowed_modules debe incluir detection y recognition para "
+            f"el backend {backend}."
         )
 
     interpolation = str(blend.get("interpolation", "cubic")).lower()
@@ -203,5 +204,4 @@ def load_config(path: Path) -> AppConfig:
             postprocess_workers=max(0, int(performance.get("postprocess_workers", 0))),
             opencv_threads=max(0, int(performance.get("opencv_threads", 0))),
         ),
-        watermark=WatermarkConfig(**raw["watermark"]),
     )

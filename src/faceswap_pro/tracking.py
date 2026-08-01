@@ -215,6 +215,12 @@ class TemporalFaceTracker:
         result = self.state.face_template.clone()
         result.bbox = self.state.bbox.copy()
         result.kps = self.state.kps.copy()
+        if result.geometry is not None and result.geometry.landmarks.size:
+            moved_dense = cv2.transform(
+                result.geometry.landmarks[None, :, :2].astype(np.float32),
+                transform,
+            )[0]
+            result.geometry.landmarks[:, :2] = moved_dense
         return result
 
     def select(self, frame, faces):

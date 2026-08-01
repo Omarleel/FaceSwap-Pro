@@ -1,0 +1,90 @@
+engine:
+  backend: insightface_inswapper_mediapipe_mesh
+  plugins: []
+  model_pack: buffalo_l
+  det_size: [640, 640]
+  det_thresh: 0.52
+  allowed_modules:
+    - detection
+    - recognition
+  max_faces: 12
+  providers:
+    - CUDAExecutionProvider
+    - CPUExecutionProvider
+  cuda:
+    device_id: 0
+    arena_extend_strategy: kNextPowerOfTwo
+    cudnn_conv_algo_search: EXHAUSTIVE
+    cudnn_conv_use_max_workspace: "1"
+    do_copy_in_default_stream: "1"
+    use_tf32: "1"
+  options:
+    # Postproceso por malla sobre INSwapper. No condiciona el generador con geometría 3D.
+    base_backend: insightface_inswapper
+    geometry_model_path: models/face_landmarker.task
+    geometry_crop_padding: 0.14
+    geometry_min_detection_confidence: 0.50
+    geometry_min_presence_confidence: 0.50
+    geometry_min_tracking_confidence: 0.50
+    mesh_warp: true
+    mesh_sample_step: 7
+    mesh_mask_erode_ratio: 0.012
+    mesh_mask_blur_ratio: 0.035
+    pitch_fade_start: 30.0
+    pitch_limit: 62.0
+    yaw_fade_start: 52.0
+    yaw_limit: 80.0
+    minimum_pose_opacity: 0.30
+
+identity:
+  source_min_score: 0.60
+  target_min_similarity: 0.30
+  max_source_images: 40
+
+tracking:
+  # La malla postprocesa el movimiento fino; menos suavizado reduce el retraso.
+  smoothing: 0.36
+  max_missing_frames: 3
+  scene_cut_threshold: 0.42
+  detection_interval: 1
+  full_scan_interval: 24
+  max_recognition_candidates: 3
+  optical_flow: false
+  flow_win_size: 31
+  flow_max_level: 3
+  flow_max_error: 25.0
+
+blend:
+  aligned_size: 512
+  mask_shrink: 0.94
+  mask_blur_ratio: 0.030
+  color_match_strength: 0.48
+  detail_strength: 0.08
+  roi_enabled: true
+  roi_margin: 0.16
+  interpolation: lanczos
+
+restorer:
+  enabled: false
+  model_path: models/face_restorer.onnx
+  input_size: 512
+  output_range: auto
+
+encoding:
+  codec: h264_nvenc
+  preset: p6
+  cq: 16
+  audio_bitrate: 256k
+  fallback_codec: libx264
+  fallback_preset: slow
+  fallback_crf: 16
+
+performance:
+  decoder: auto
+  hardware_decode: true
+  reader_queue: 4
+  analysis_queue: 2
+  writer_queue: 4
+  max_inflight: 3
+  postprocess_workers: 1
+  opencv_threads: 0

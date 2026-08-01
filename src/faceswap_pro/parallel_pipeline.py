@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
-from .modeling import FaceAnalyzer, FaceData, FaceRestorer, FaceSwapper
+from .modeling import FaceAnalyzer, FaceData, FaceRestorer, FaceSwapper, SwapResult
 from .provenance import add_disclosure
 
 _SENTINEL = object()
@@ -241,18 +241,24 @@ def _writer_worker(
 
 def _postprocess(
     packet: AnalyzedPacket,
-    fake_crop: np.ndarray | None,
-    affine: np.ndarray | None,
+    swap_result: SwapResult | None,
     blender,
     restorer,
-    watermark_text: str,
 ) -> ProcessedPacket:
     started = time.perf_counter()
     frame = packet.frame
-    swapped = fake_crop is not None and affine is not None
-    if swapped:
-        frame = blender.composite(frame, fake_crop, affine, restorer)
-    frame = add_disclosure(frame, watermark_text)
+    swapped = swap_result is not None and swap_result.opacity > 0.0
+    if swapped and swap_result is not None:
+        frame = blender.composite(
+            frame,
+            swap_result.crop,
+            swap_result.affine,
+            restorer,
+            mask=swap_result.mask,
+            opacity=swap_result.opacity,
+            mask_mode=swap_result.mask_mode,
+        )
+    frame = add_disclosure(frame)
     return ProcessedPacket(
         index=packet.index,
         frame=np.ascontiguousarray(frame),
@@ -351,8 +357,7 @@ def run_parallel_frames(
             if packet is _SENTINEL:
                 break
 
-            fake_crop = None
-            affine = None
+            swap_result = None
             if packet.target_face is not None:
                 swap_started = time.perf_counter()
                 swap_result = swapper.swap(
@@ -360,17 +365,14 @@ def run_parallel_frames(
                     packet.target_face,
                     source_face,
                 )
-                fake_crop, affine = swap_result.crop, swap_result.affine
                 stats.add(swap_seconds=time.perf_counter() - swap_started)
 
             pending[packet.index] = executor.submit(
                 _postprocess,
                 packet,
-                fake_crop,
-                affine,
+                swap_result,
                 blender,
                 restorer,
-                config.watermark.text,
             )
             progress.update(1)
 

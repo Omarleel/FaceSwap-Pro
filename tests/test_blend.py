@@ -56,3 +56,30 @@ def test_roi_and_full_frame_blend_are_equivalent():
     )
 
     assert np.array_equal(roi, full)
+
+
+def test_replace_mask_does_not_multiply_by_legacy_ellipse():
+    blender = ProfessionalBlender(
+        aligned_size=16,
+        mask_shrink=0.2,
+        mask_blur_ratio=0.01,
+        color_match_strength=0.0,
+        detail_strength=0.0,
+        roi_enabled=False,
+        interpolation="linear",
+    )
+    frame = np.zeros((16, 16, 3), dtype=np.uint8)
+    fake = np.full((16, 16, 3), 255, dtype=np.uint8)
+    affine = np.eye(2, 3, dtype=np.float32)
+    learned_mask = np.ones((16, 16, 1), dtype=np.float32)
+
+    result = blender.composite(
+        frame,
+        fake,
+        affine,
+        IdentityRestorer(),
+        mask=learned_mask,
+        mask_mode="replace",
+    )
+
+    assert result[0, 0].min() == 255

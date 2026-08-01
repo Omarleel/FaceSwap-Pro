@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import platform
@@ -41,6 +42,103 @@ app = typer.Typer(
 console = Console()
 
 
+def _resolve_model_path(config, override: Path | None = None) -> Path:
+    configured = config.engine.options.get("model_path")
+    if override is not None:
+        return override
+    if configured not in (None, ""):
+        return Path(str(configured))
+    return DEFAULT_SWAPPER_MODEL
+
+
+def _optional_path(options: dict[str, object], name: str) -> Path | None:
+    value = options.get(name)
+    if value in (None, ""):
+        return None
+    return Path(str(value))
+
+
+def _hififace_readiness(config, model_path: Path) -> dict[str, object]:
+    options = config.engine.options
+    iteration = options.get("checkpoint_iteration")
+    generator_name = (
+        "generator.pth" if iteration in (None, "") else f"generator_{int(iteration)}.pth"
+    )
+    repository = _optional_path(options, "repository_path")
+    f3d = _optional_path(options, "f_3d_checkpoint_path")
+    fid = _optional_path(options, "f_id_checkpoint_path")
+    bfm = _optional_path(options, "bfm_folder")
+    device = str(options.get("device", "cuda:0"))
+    bfm_required = (
+        "01_MorphableModel.mat",
+        "BFM_exp_idx.mat",
+        "BFM_front_idx.mat",
+        "BFM_model_front.mat",
+        "Exp_Pca.bin",
+        "facemodel_info.mat",
+        "select_vertex_id.mat",
+        "similarity_Lm3D_all.mat",
+        "std_exp.txt",
+    )
+
+    checkpoint = model_path / generator_name
+    repository_ready = bool(
+        repository is not None
+        and repository.is_dir()
+        and (repository / "models" / "model.py").is_file()
+        and (repository / "models" / "generator.py").is_file()
+    )
+    bfm_ready = bool(
+        bfm is not None
+        and bfm.is_dir()
+        and all((bfm / name).is_file() for name in bfm_required)
+    )
+    checks = {
+        "repository": repository_ready,
+        "checkpoint_directory": model_path.is_dir(),
+        "generator_checkpoint": checkpoint.is_file(),
+        "f_3d_checkpoint": bool(f3d is not None and f3d.is_file()),
+        "f_id_checkpoint": bool(fid is not None and fid.is_file()),
+        "bfm_folder": bool(bfm is not None and bfm.is_dir()),
+        "bfm_files": bfm_ready,
+        "torch_installed": importlib.util.find_spec("torch") is not None,
+        "torchvision_installed": importlib.util.find_spec("torchvision") is not None,
+        "kornia_installed": importlib.util.find_spec("kornia") is not None,
+        "loguru_installed": importlib.util.find_spec("loguru") is not None,
+    }
+    cuda_available = False
+    torch_error = None
+    torch_version = None
+    torch_cuda_runtime = None
+    torch_gpu = None
+    if checks["torch_installed"]:
+        try:
+            import torch
+
+            torch_version = torch.__version__
+            torch_cuda_runtime = torch.version.cuda
+            cuda_available = bool(torch.cuda.is_available())
+            if cuda_available:
+                torch_gpu = torch.cuda.get_device_name(0)
+        except Exception as exc:
+            cuda_available = False
+            torch_error = f"{type(exc).__name__}: {exc}"
+    checks["torch_device"] = not device.startswith("cuda") or cuda_available
+    return {
+        "model_path": str(model_path),
+        "expected_generator": str(checkpoint),
+        "repository_path": None if repository is None else str(repository),
+        "device": device,
+        "torch_version": torch_version,
+        "torch_cuda_runtime": torch_cuda_runtime,
+        "torch_cuda_available": cuda_available,
+        "torch_gpu": torch_gpu,
+        "torch_error": torch_error,
+        "checks": checks,
+        "ready": all(checks.values()),
+    }
+
+
 @app.command("init")
 def init_project() -> None:
     """Crea la estructura estándar de entradas, modelos y salidas."""
@@ -76,14 +174,18 @@ def run(
         dir_okay=False,
         help="Referencia del sujeto que será reemplazado en el video.",
     ),
-    swapper_model: Path = typer.Option(
-        DEFAULT_SWAPPER_MODEL,
+    model_path: Path | None = typer.Option(
+        None,
         "--model",
+        "--model-path",
         "--swapper-model",
-        exists=True,
+        exists=False,
         file_okay=True,
-        dir_okay=False,
-        help="Archivo del modelo principal seleccionado por engine.backend.",
+        dir_okay=True,
+        help=(
+            "Archivo o directorio del modelo principal. Si se omite, se usa "
+            "engine.options.model_path o models/inswapper_128.onnx."
+        ),
     ),
     output_video: Path | None = typer.Option(
         None,
@@ -114,13 +216,20 @@ def run(
     """Procesa un sujeto objetivo identificado por una imagen de referencia."""
     resolved_output = build_output_path(input_video, output_video, output_dir)
     config = load_config(config_file)
+    effective_model = _resolve_model_path(config, model_path)
+    if not effective_model.exists():
+        raise typer.BadParameter(
+            f"No existe el modelo principal: {effective_model}",
+            param_hint="--model-path / engine.options.model_path",
+        )
     console.print(f"[cyan]Entrada:[/cyan] {input_video}")
     console.print(f"[cyan]Salida:[/cyan] {resolved_output}")
+    console.print(f"[cyan]Modelo principal:[/cyan] {effective_model}")
     run_pipeline(
         input_video=input_video,
         source_dir=source_dir,
         target_reference=target_reference,
-        swapper_model=swapper_model,
+        model_path=effective_model,
         output_video=resolved_output,
         manifest_dir=manifest_dir,
         config=config,
@@ -128,8 +237,17 @@ def run(
 
 
 @app.command()
-def doctor() -> None:
-    """Comprueba CUDA EP, FFmpeg, NVDEC y NVENC antes de procesar."""
+def doctor(
+    config_file: Path | None = typer.Option(
+        None,
+        "--config",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        help="Perfil opcional para validar también los artefactos del backend.",
+    ),
+) -> None:
+    """Comprueba GPU, video y los artefactos del backend configurado."""
     try:
         import onnxruntime as ort
     except ModuleNotFoundError as exc:
@@ -140,6 +258,8 @@ def doctor() -> None:
     ffmpeg_path = select_ffmpeg("h264_nvenc")
     ffmpeg = str(ffmpeg_path) if ffmpeg_path else None
     nvenc = bool(ffmpeg_path and ffmpeg_has_encoder(ffmpeg_path, "h264_nvenc"))
+    geometry_model = Path("models/face_landmarker.task")
+    mediapipe_installed = importlib.util.find_spec("mediapipe") is not None
     report = {
         "project": "FaceSwap-Pro",
         "model_backends": list(available_model_backends()),
@@ -152,12 +272,54 @@ def doctor() -> None:
         "h264_nvenc": nvenc,
         "cuda_hw_decode": bool(ffmpeg_path and ffmpeg_has_hwaccel(ffmpeg_path, "cuda")),
         "logical_cpu_count": os.cpu_count(),
+        "mediapipe_installed": mediapipe_installed,
+        "face_landmarker_model": str(geometry_model),
+        "face_landmarker_model_exists": geometry_model.is_file(),
+        "mediapipe_mesh_assist_ready": mediapipe_installed and geometry_model.is_file(),
+        "torch_installed": importlib.util.find_spec("torch") is not None,
     }
+    configured_backend_ready = True
+    configured_backend = None
+    if config_file is not None:
+        selected_config = load_config(config_file)
+        configured_model = _resolve_model_path(selected_config)
+        configured_backend = selected_config.engine.backend
+        report["configured_backend"] = configured_backend
+        report["configured_model"] = str(configured_model)
+        if configured_backend == "hififace_3dmm":
+            readiness = _hififace_readiness(selected_config, configured_model)
+            report["hififace_3dmm"] = readiness
+            configured_backend_ready = bool(readiness["ready"])
+        elif configured_backend in {
+            "insightface_inswapper_mediapipe_mesh",
+            "mediapipe_3d_hybrid",
+        }:
+            configured_backend_ready = bool(report["mediapipe_mesh_assist_ready"])
+            report["backend_note"] = (
+                "Postproceso por malla; geometry_conditioning=none."
+            )
+        else:
+            configured_backend_ready = configured_model.is_file()
+        report["configured_backend_ready"] = configured_backend_ready
     console.print(Panel.fit(json.dumps(report, indent=2, ensure_ascii=False), title="Diagnóstico"))
     if not report["cuda_provider_ok"]:
         raise typer.Exit(code=2)
     if not ffmpeg or not nvenc:
         console.print("[yellow]GPU ONNX disponible, pero falta FFmpeg con h264_nvenc.[/yellow]")
+    if configured_backend in {
+        "insightface_inswapper_mediapipe_mesh",
+        "mediapipe_3d_hybrid",
+    } and not report["mediapipe_mesh_assist_ready"]:
+        console.print(
+            "[yellow]El backend asistido por malla no está listo: instala MediaPipe "
+            "y añade models/face_landmarker.task.[/yellow]"
+        )
+    if config_file is not None and not configured_backend_ready:
+        console.print(
+            "[red]El backend configurado no está listo. Revisa el bloque de "
+            "diagnóstico anterior.[/red]"
+        )
+        raise typer.Exit(code=2)
 
 
 if __name__ == "__main__":

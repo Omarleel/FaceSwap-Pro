@@ -16,6 +16,9 @@ PROJECT_DIRECTORIES = (
     Path("inputs/source_faces"),
     Path("inputs/target_faces"),
     Path("models"),
+    Path("models/hififace/standard_model"),
+    Path("models/hififace/aux"),
+    Path("third_party"),
     DEFAULT_OUTPUT_DIR,
     DEFAULT_MANIFEST_DIR,
 )

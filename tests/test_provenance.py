@@ -37,3 +37,18 @@ def test_manifest_is_written_to_dedicated_directory(tmp_path):
     assert manifest == manifests / "result.manifest.json"
     assert manifest.is_file()
     text = manifest.read_text(encoding="utf-8")
+
+def test_sha256_path_supports_model_directories(tmp_path):
+    from faceswap_pro.provenance import sha256_path
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "a.bin").write_bytes(b"a")
+    (model_dir / "b.bin").write_bytes(b"b")
+
+    first = sha256_path(model_dir)
+    second = sha256_path(model_dir)
+    (model_dir / "b.bin").write_bytes(b"changed")
+
+    assert first == second
+    assert sha256_path(model_dir) != first

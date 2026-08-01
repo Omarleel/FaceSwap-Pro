@@ -1,0 +1,100 @@
+# Alias legible del perfil 3DMM real. El nombre más explícito es quality_3dmm.yaml.
+engine:
+  # Generador condicionado internamente por coeficientes 3DMM.
+  backend: hififace_3dmm
+  plugins: []
+  model_pack: buffalo_l
+  det_size: [640, 640]
+  det_thresh: 0.52
+  allowed_modules:
+    - detection
+    - recognition
+  max_faces: 12
+  providers:
+    - CUDAExecutionProvider
+    - CPUExecutionProvider
+  cuda:
+    device_id: 0
+    arena_extend_strategy: kNextPowerOfTwo
+    cudnn_conv_algo_search: EXHAUSTIVE
+    cudnn_conv_use_max_workspace: "1"
+    do_copy_in_default_stream: "1"
+    use_tf32: "1"
+  options:
+    # --model-path puede sustituir esta ruta. Es un directorio con generator_80000.pth.
+    model_path: models/hififace/standard_model
+    repository_path: third_party/HiFiFace-pytorch
+    checkpoint_iteration: 80000
+
+    # Modelos auxiliares del extractor de identidad 3DMM.
+    f_3d_checkpoint_path: models/hififace/aux/Deep3DFaceRecon/epoch_20_new.pth
+    f_id_checkpoint_path: models/hififace/aux/arcface/ms1mv3_arcface_r100_fp16_backbone.pth
+    bfm_folder: models/hififace/aux/BFM
+    # Solo se requiere para el checkpoint entrenado con pérdidas de mirada/boca.
+    # hrnet_path: models/hififace/aux/face_98lmks/HR18-WFLW.pth
+
+    device: cuda:0
+    use_fp16: false
+    output_size: 256
+    shape_rate: 1.0
+    identity_rate: 1.0
+    iterations: 1
+
+    # La salida ya contiene Semantic Facial Fusion; esta máscara solo delimita
+    # la reproyección del crop al frame completo.
+    mask_dilate_ratio: 0.025
+    mask_blur_ratio: 0.018
+
+identity:
+  source_min_score: 0.60
+  target_min_similarity: 0.30
+  max_source_images: 40
+
+tracking:
+  smoothing: 0.32
+  max_missing_frames: 3
+  scene_cut_threshold: 0.42
+  detection_interval: 1
+  full_scan_interval: 24
+  max_recognition_candidates: 3
+  optical_flow: false
+  flow_win_size: 31
+  flow_max_level: 3
+  flow_max_error: 25.0
+
+blend:
+  aligned_size: 512
+  mask_shrink: 0.94
+  mask_blur_ratio: 0.025
+  # HifiFace ya conserva iluminación y fondo mediante su SFF.
+  color_match_strength: 0.08
+  detail_strength: 0.04
+  roi_enabled: true
+  roi_margin: 0.16
+  interpolation: lanczos
+
+restorer:
+  enabled: false
+  model_path: models/face_restorer.onnx
+  input_size: 512
+  output_range: auto
+
+encoding:
+  codec: h264_nvenc
+  preset: p6
+  cq: 16
+  audio_bitrate: 256k
+  fallback_codec: libx264
+  fallback_preset: slow
+  fallback_crf: 16
+
+performance:
+  decoder: auto
+  hardware_decode: true
+  reader_queue: 4
+  analysis_queue: 2
+  writer_queue: 4
+  # PyTorch/HifiFace debe ejecutarse de forma serial en una sola GPU.
+  max_inflight: 2
+  postprocess_workers: 1
+  opencv_threads: 0

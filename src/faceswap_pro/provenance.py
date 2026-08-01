@@ -13,6 +13,9 @@ from . import __version__
 from .paths import build_manifest_path
 
 
+DISCLOSURE_TEXT = "CONTENIDO SINTÉTICO · IA"
+
+
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -21,7 +24,32 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
-def add_disclosure(frame, text: str):
+def sha256_path(path: Path) -> str:
+    """Hash reproducible de un archivo o de un árbol de modelos."""
+
+    if path.is_file():
+        return sha256_file(path)
+    if not path.is_dir():
+        raise FileNotFoundError(path)
+    digest = hashlib.sha256()
+    for child in sorted(item for item in path.rglob("*") if item.is_file()):
+        relative = child.relative_to(path).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        file_hash = bytes.fromhex(sha256_file(child))
+        digest.update(file_hash)
+    return digest.hexdigest()
+
+
+def model_record(path: Path) -> dict[str, str]:
+    return {
+        "path": str(path),
+        "kind": "directory" if path.is_dir() else "file",
+        "sha256": sha256_path(path),
+    }
+
+
+def add_disclosure(frame, text: str = DISCLOSURE_TEXT):
     """Añade una etiqueta visible de contenido sintético."""
     h, w = frame.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -60,13 +88,14 @@ def write_manifest(
     target_reference: Path,
     model_path: Path,
     runtime: dict[str, Any],
+    additional_model_paths: list[Path] | None = None,
 ) -> Path:
     manifest_path = build_manifest_path(output_video, manifest_dir)
     payload = {
         "schema": "faceswap-pro-manifest-v1",
         "project": {"name": "FaceSwap-Pro", "version": __version__},
         "created_utc": datetime.now(timezone.utc).isoformat(),
-        "disclosure": "CONTENIDO SINTÉTICO · IA",
+        "disclosure": DISCLOSURE_TEXT,
         "output_video": {"path": str(output_video)},
         "input_video": {"path": str(input_video), "sha256": sha256_file(input_video)},
         "target_reference": {
@@ -76,7 +105,12 @@ def write_manifest(
         "source_images": [
             {"path": str(path), "sha256": sha256_file(path)} for path in source_images
         ],
-        "model": {"path": str(model_path), "sha256": sha256_file(model_path)},
+        "model": model_record(model_path),
+        "additional_models": [
+            model_record(path)
+            for path in (additional_model_paths or [])
+            if path.exists()
+        ],
         "runtime": runtime,
     }
     manifest_path.write_text(

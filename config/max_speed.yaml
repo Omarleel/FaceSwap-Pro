@@ -71,6 +71,3 @@ performance:
   max_inflight: 8
   postprocess_workers: 0
   opencv_threads: 0
-
-watermark:
-  text: "CONTENIDO SINTÉTICO · IA"

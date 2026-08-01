@@ -75,6 +75,9 @@ class ProfessionalBlender:
         fake_128: np.ndarray,
         affine_128: np.ndarray,
         restorer,
+        supplied_mask: np.ndarray | None = None,
+        opacity: float = 1.0,
+        mask_mode: str = "multiply",
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         scale = self.aligned_size / float(fake_128.shape[0])
         affine = np.asarray(affine_128, dtype=np.float32).copy()
@@ -92,7 +95,32 @@ class ProfessionalBlender:
             interpolation=self.interpolation,
         )
         fake = restorer.restore(fake)
-        mask = self._cached_mask
+        mask = self._cached_mask.copy()
+        if supplied_mask is not None:
+            adaptive = np.asarray(supplied_mask, dtype=np.float32)
+            if adaptive.ndim == 2:
+                adaptive = adaptive[..., None]
+            if adaptive.shape[:2] != (self.aligned_size, self.aligned_size):
+                adaptive = cv2.resize(
+                    adaptive,
+                    (self.aligned_size, self.aligned_size),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                if adaptive.ndim == 2:
+                    adaptive = adaptive[..., None]
+            if mask_mode == "replace":
+                mask = np.clip(adaptive, 0.0, 1.0)
+            elif mask_mode == "multiply":
+                mask = np.clip(mask * adaptive, 0.0, 1.0)
+            else:
+                raise ValueError(
+                    f"mask_mode debe ser 'multiply' o 'replace', recibido: {mask_mode!r}."
+                )
+        elif mask_mode not in {"multiply", "replace"}:
+            raise ValueError(
+                f"mask_mode debe ser 'multiply' o 'replace', recibido: {mask_mode!r}."
+            )
+        mask *= float(np.clip(opacity, 0.0, 1.0))
         fake = self._color_match(fake, aligned_target, mask)
         fake = self._detail(fake)
         return fake, mask, cv2.invertAffineTransform(affine)
@@ -189,8 +217,20 @@ class ProfessionalBlender:
         fake_128: np.ndarray,
         affine_128: np.ndarray,
         restorer,
+        *,
+        mask: np.ndarray | None = None,
+        opacity: float = 1.0,
+        mask_mode: str = "multiply",
     ) -> np.ndarray:
-        fake, mask, inverse = self._prepare_aligned(frame, fake_128, affine_128, restorer)
+        fake, mask, inverse = self._prepare_aligned(
+            frame,
+            fake_128,
+            affine_128,
+            restorer,
+            supplied_mask=mask,
+            opacity=opacity,
+            mask_mode=mask_mode,
+        )
         if self.roi_enabled:
             return self._composite_roi(frame, fake, mask, inverse)
         return self._composite_full(frame, fake, mask, inverse)

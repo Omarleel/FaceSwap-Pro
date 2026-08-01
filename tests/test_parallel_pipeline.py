@@ -110,7 +110,6 @@ def test_parallel_pipeline_preserves_order_and_processes_all_frames():
             full_scan_interval=4,
             optical_flow=False,
         ),
-        watermark=SimpleNamespace(text="CONTENIDO SINTÉTICO · IA"),
     )
 
     stats, settings = run_parallel_frames(

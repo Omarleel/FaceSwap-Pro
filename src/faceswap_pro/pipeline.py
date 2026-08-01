@@ -24,7 +24,7 @@ def run_pipeline(
     input_video: Path,
     source_dir: Path,
     target_reference: Path,
-    swapper_model: Path,
+    model_path: Path,
     output_video: Path,
     manifest_dir: Path,
     config,
@@ -37,15 +37,17 @@ def run_pipeline(
     fábrica registrada según ``engine.backend``.
     """
 
-    for required in (input_video, target_reference, swapper_model):
+    for required in (input_video, target_reference):
         if not required.is_file():
             raise FileNotFoundError(required)
+    if not model_path.exists():
+        raise FileNotFoundError(model_path)
     if not source_dir.is_dir():
         raise NotADirectoryError(source_dir)
     output_video.parent.mkdir(parents=True, exist_ok=True)
     manifest_dir.mkdir(parents=True, exist_ok=True)
 
-    models = model_bundle or initialize_models(config, swapper_model)
+    models = model_bundle or initialize_models(config, model_path)
     analyzer = models.analyzer
     source_face, source_paths = build_source_identity(
         analyzer,
@@ -80,7 +82,10 @@ def run_pipeline(
 
     console.print(
         "[cyan]Pipeline:[/cyan] "
-        f"backend={models.backend}, decoder={reader.backend}, "
+        f"backend={models.backend}, generador={models.capabilities.generator}, "
+        f"3D condicionado={'sí' if models.capabilities.truly_3d_aware else 'no'}, "
+        f"postproceso={models.capabilities.geometry_postprocess}, "
+        f"decoder={reader.backend}, "
         f"detección cada {config.tracking.detection_interval} frames, "
         f"blend ROI={'sí' if config.blend.roi_enabled else 'no'}"
     )
@@ -126,6 +131,14 @@ def run_pipeline(
         "python": platform.python_version(),
         "model_backend": models.backend,
         "model_runtime": dict(models.runtime),
+        "model_capabilities": {
+            "generator": models.capabilities.generator,
+            "native_output_size": models.capabilities.native_output_size,
+            "geometry_conditioning": models.capabilities.geometry_conditioning,
+            "geometry_postprocess": models.capabilities.geometry_postprocess,
+            "temporal_generation": models.capabilities.temporal_generation,
+            "truly_3d_aware": models.capabilities.truly_3d_aware,
+        },
         "providers_requested": list(models.providers),
         "decoder_backend": reader.backend,
         "encoder_codec": writer.used_codec,
@@ -137,14 +150,19 @@ def run_pipeline(
         "pipeline_settings": pipeline_settings,
         "pipeline_stats": stats_dict,
     }
+    additional_model_paths = [
+        path for path in models.model_artifacts if path.resolve() != model_path.resolve()
+    ]
+
     manifest = write_manifest(
         output_video=output_video,
         manifest_dir=manifest_dir,
         input_video=input_video,
         source_images=source_paths,
         target_reference=target_reference,
-        model_path=swapper_model,
+        model_path=model_path,
         runtime=runtime,
+        additional_model_paths=additional_model_paths,
     )
     console.print(f"[bold green]Video creado:[/bold green] {output_video}")
     console.print(f"[bold green]Manifiesto:[/bold green] {manifest}")
