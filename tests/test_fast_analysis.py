@@ -61,3 +61,25 @@ def test_full_scan_recognizes_all_capped_faces():
     assert len(faces) == 2
     assert stats.detected == 3
     assert stats.recognized == 2
+
+
+def test_selective_analysis_reserves_one_candidate_per_active_reflection_track():
+    app = DummyApp()
+    analyzer = SelectiveFaceAnalyzer(app, max_faces=10, max_recognition_candidates=1)
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+
+    faces, stats = analyzer.analyze(
+        frame,
+        previous_bbox=np.array(
+            [[4, 4, 26, 26], [69, 4, 91, 26]],
+            dtype=np.float32,
+        ),
+        full_scan=False,
+    )
+
+    assert stats.recognized == 2
+    assert len(faces) == 2
+    assert {tuple(face.bbox.tolist()) for face in faces} == {
+        (5.0, 5.0, 25.0, 25.0),
+        (70.0, 5.0, 90.0, 25.0),
+    }

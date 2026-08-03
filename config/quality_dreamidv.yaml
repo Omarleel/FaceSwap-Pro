@@ -84,6 +84,7 @@ tracking:
   detection_interval: 1
   full_scan_interval: 30
   max_recognition_candidates: 4
+  max_target_faces: 2
   optical_flow: true
   flow_win_size: 31
   flow_max_level: 3

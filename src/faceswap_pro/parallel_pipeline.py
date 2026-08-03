@@ -28,7 +28,12 @@ class FramePacket:
 class AnalyzedPacket:
     index: int
     frame: np.ndarray
-    target_face: FaceData | None
+    target_faces: tuple[FaceData, ...] = ()
+
+    @property
+    def target_face(self) -> FaceData | None:
+        """Compatibilidad con extensiones que consumían una sola cara."""
+        return self.target_faces[-1] if self.target_faces else None
 
 
 @dataclass(frozen=True)
@@ -36,6 +41,7 @@ class ProcessedPacket:
     index: int
     frame: np.ndarray
     swapped: bool
+    swapped_faces: int
     postprocess_seconds: float
 
 
@@ -49,6 +55,7 @@ class PipelineStats:
     detected_faces: int = 0
     recognition_inferences: int = 0
     swapped_frames: int = 0
+    swapped_faces: int = 0
     written_frames: int = 0
     decode_seconds: float = 0.0
     analysis_seconds: float = 0.0
@@ -139,6 +146,28 @@ def _analysis_worker(
     tracker,
     tracking_config,
 ) -> None:
+    def previous_regions():
+        bboxes = getattr(tracker, "current_bboxes", None)
+        if bboxes and bool(
+            getattr(analyzer, "supports_multiple_previous_bboxes", False)
+        ):
+            return bboxes
+        return getattr(tracker, "current_bbox", None)
+
+    def select_faces(frame, gray, faces) -> tuple[FaceData, ...]:
+        method = getattr(tracker, "select_all_detected", None)
+        if callable(method):
+            return tuple(method(frame, gray, faces))
+        selected = tracker.select_detected(frame, gray, faces)
+        return () if selected is None else (selected,)
+
+    def propagate_faces(frame, gray) -> tuple[FaceData, ...]:
+        method = getattr(tracker, "propagate_all", None)
+        if callable(method):
+            return tuple(method(frame, gray))
+        selected = tracker.propagate(frame, gray)
+        return () if selected is None else (selected,)
+
     try:
         while not stop.is_set():
             try:
@@ -156,7 +185,7 @@ def _analysis_worker(
                 or tracker.needs_redetect
                 or packet.index % tracking_config.detection_interval == 0
             )
-            target_face = None
+            target_faces: tuple[FaceData, ...] = ()
             used_flow = False
 
             if detection_due:
@@ -167,10 +196,10 @@ def _analysis_worker(
                 )
                 faces, detection_stats = analyzer.analyze(
                     packet.frame,
-                    previous_bbox=tracker.current_bbox,
+                    previous_bbox=previous_regions(),
                     full_scan=full_scan,
                 )
-                target_face = tracker.select_detected(packet.frame, gray, faces)
+                target_faces = select_faces(packet.frame, gray, faces)
                 stats.add(
                     detection_frames=1,
                     full_scans=int(detection_stats.full_scan),
@@ -178,16 +207,17 @@ def _analysis_worker(
                     recognition_inferences=detection_stats.recognized,
                 )
             else:
-                target_face = tracker.propagate(packet.frame, gray)
-                used_flow = target_face is not None
-                if target_face is None:
-                    # Redetección inmediata: evita perder un frame cuando LK falla.
+                target_faces = propagate_faces(packet.frame, gray)
+                used_flow = bool(target_faces)
+                if not target_faces or tracker.needs_redetect:
+                    # Redetección inmediata: evita perder un frame cuando LK falla
+                    # en una o en todas las apariciones del sujeto.
                     faces, detection_stats = analyzer.analyze(
                         packet.frame,
-                        previous_bbox=tracker.current_bbox,
+                        previous_bbox=previous_regions(),
                         full_scan=True,
                     )
-                    target_face = tracker.select_detected(packet.frame, gray, faces)
+                    target_faces = select_faces(packet.frame, gray, faces)
                     stats.add(
                         detection_frames=1,
                         full_scans=1,
@@ -202,7 +232,7 @@ def _analysis_worker(
             )
             if not _queue_put(
                 output_queue,
-                AnalyzedPacket(packet.index, packet.frame, target_face),
+                AnalyzedPacket(packet.index, packet.frame, target_faces),
                 stop,
             ):
                 return
@@ -231,6 +261,7 @@ def _writer_worker(
             stats.add(
                 written_frames=1,
                 swapped_frames=int(packet.swapped),
+                swapped_faces=packet.swapped_faces,
                 postprocess_seconds=packet.postprocess_seconds,
                 encode_feed_seconds=time.perf_counter() - started,
             )
@@ -241,15 +272,17 @@ def _writer_worker(
 
 def _postprocess(
     packet: AnalyzedPacket,
-    swap_result: SwapResult | None,
+    swap_results: tuple[SwapResult, ...],
     blender,
     restorer,
     visible_disclosure: bool,
 ) -> ProcessedPacket:
     started = time.perf_counter()
     frame = packet.frame
-    swapped = swap_result is not None and swap_result.opacity > 0.0
-    if swapped and swap_result is not None:
+    swapped_faces = 0
+    for swap_result in swap_results:
+        if swap_result.opacity <= 0.0:
+            continue
         frame = blender.composite(
             frame,
             swap_result.crop,
@@ -259,12 +292,14 @@ def _postprocess(
             opacity=swap_result.opacity,
             mask_mode=swap_result.mask_mode,
         )
+        swapped_faces += 1
     if visible_disclosure:
         frame = add_disclosure(frame)
     return ProcessedPacket(
         index=packet.index,
         frame=np.ascontiguousarray(frame),
-        swapped=swapped,
+        swapped=swapped_faces > 0,
+        swapped_faces=swapped_faces,
         postprocess_seconds=time.perf_counter() - started,
     )
 
@@ -361,20 +396,23 @@ def run_parallel_frames(
             if packet is _SENTINEL:
                 break
 
-            swap_result = None
-            if packet.target_face is not None:
+            swap_results: list[SwapResult] = []
+            if packet.target_faces:
                 swap_started = time.perf_counter()
-                swap_result = swapper.swap(
-                    packet.frame,
-                    packet.target_face,
-                    source_face,
-                )
+                for target_face in packet.target_faces:
+                    swap_results.append(
+                        swapper.swap(
+                            packet.frame,
+                            target_face,
+                            source_face,
+                        )
+                    )
                 stats.add(swap_seconds=time.perf_counter() - swap_started)
 
             pending[packet.index] = executor.submit(
                 _postprocess,
                 packet,
-                swap_result,
+                tuple(swap_results),
                 blender,
                 restorer,
                 visible_disclosure,
@@ -412,5 +450,8 @@ def run_parallel_frames(
         "detection_interval": config.tracking.detection_interval,
         "full_scan_interval": config.tracking.full_scan_interval,
         "optical_flow": config.tracking.optical_flow,
+        "max_target_faces": int(
+            getattr(config.tracking, "max_target_faces", 1)
+        ),
     }
     return stats, settings

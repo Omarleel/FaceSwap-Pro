@@ -1,16 +1,17 @@
 # Informe de validación de la implementación
 
-Fecha de validación del paquete: 2026-08-02.
+Fecha de validación del paquete: 2026-08-03.
 
 ## Resultado automatizado
 
 ```text
-68 passed
+73 passed
 ```
 
 La suite incluye las pruebas existentes y regresiones nuevas para planificación de
-clips, tracking objetivo, banco multi-referencia, composición selectiva, hoja visual,
-hashes cacheados, metadatos de color y C2PA.
+clips, tracking multiinstancia del actor y su reflexión, reconocimiento reservado
+por trayectoria, doble composición por frame, unión de máscaras DreamID-V, banco
+multi-referencia, hoja visual, hashes cacheados, metadatos de color y C2PA.
 
 ## Prueba FFmpeg real
 

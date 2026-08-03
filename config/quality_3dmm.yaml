@@ -26,11 +26,11 @@ engine:
     checkpoint_iteration: 320000
 
     # Modelos auxiliares del extractor de identidad 3DMM.
-    f_3d_checkpoint_path: models/hififace/aux/Deep3DFaceRecon/epoch_20_new.pth
-    f_id_checkpoint_path: models/hififace/aux/arcface/ms1mv3_arcface_r100_fp16_backbone.pth
-    bfm_folder: models/hififace/aux/BFM
+    f_3d_checkpoint_path: models/hififace/auxiliary/Deep3DFaceRecon/epoch_20_new.pth
+    f_id_checkpoint_path: models/hififace/auxiliary/arcface/ms1mv3_arcface_r100_fp16_backbone.pth
+    bfm_folder: models/hififace/auxiliary/BFM
     # Solo se requiere para el checkpoint entrenado con pérdidas de mirada/boca.
-    # hrnet_path: models/hififace/aux/face_98lmks/HR18-WFLW.pth
+    # hrnet_path: models/hififace/auxiliary/face_98lmks/HR18-WFLW.pth
 
     device: cuda:0
     use_fp16: false
@@ -56,6 +56,7 @@ tracking:
   detection_interval: 1
   full_scan_interval: 24
   max_recognition_candidates: 3
+  max_target_faces: 2
   optical_flow: false
   flow_win_size: 31
   flow_max_level: 3

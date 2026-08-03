@@ -8,8 +8,17 @@ import cv2
 import numpy as np
 
 from .identity import estimate_pose_from_five_points
-from .math_utils import bbox_iou, cosine_similarity
-from .tracking import TemporalFaceTracker
+from .math_utils import bbox_area, bbox_iou, cosine_similarity
+from .tracking import MultiFaceTracker
+
+
+@dataclass(frozen=True)
+class TargetFaceInstance:
+    bbox: tuple[float, float, float, float]
+    kps: tuple[tuple[float, float], ...] = ()
+    yaw: float = 0.0
+    pitch: float = 0.0
+    similarity: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -22,6 +31,22 @@ class TargetTrackFrame:
     similarity: float = 0.0
     ambiguous: bool = False
     scene_cut: bool = False
+    instances: tuple[TargetFaceInstance, ...] = ()
+
+    def all_instances(self) -> tuple[TargetFaceInstance, ...]:
+        if self.instances:
+            return self.instances
+        if self.bbox is None:
+            return ()
+        return (
+            TargetFaceInstance(
+                bbox=self.bbox,
+                kps=self.kps,
+                yaw=self.yaw,
+                pitch=self.pitch,
+                similarity=self.similarity,
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -53,6 +78,7 @@ class TargetTrack:
         )
 
     def as_dict(self) -> dict[str, Any]:
+        instance_counts = [len(frame.all_instances()) for frame in self.frames]
         return {
             "fps": self.fps,
             "resolution": [self.width, self.height],
@@ -60,6 +86,8 @@ class TargetTrack:
             "scene_cuts": list(self.scene_cuts),
             "coverage": self.coverage,
             "ambiguous_ratio": self.ambiguous_ratio,
+            "average_target_faces": float(np.mean(instance_counts)) if instance_counts else 0.0,
+            "max_target_faces": max(instance_counts, default=0),
         }
 
 
@@ -78,12 +106,14 @@ def analyze_target_track(
         raise ValueError(f"No se pudo abrir el proxy para tracking: {video_path}")
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    tracker = TemporalFaceTracker(
+    max_target_faces = max(1, int(getattr(tracking, "max_target_faces", 1)))
+    tracker = MultiFaceTracker(
         target_embedding,
         min_similarity,
         tracking.smoothing,
         tracking.max_missing_frames,
         tracking.scene_cut_threshold,
+        max_faces=max_target_faces,
         optical_flow=tracking.optical_flow,
         flow_win_size=tracking.flow_win_size,
         flow_max_level=tracking.flow_max_level,
@@ -108,16 +138,21 @@ def analyze_target_track(
                 or scene_cut
                 or index % max(1, int(tracking.detection_interval)) == 0
             )
-            selected = None
+            selected: list = []
             similarity = 0.0
             ambiguous = False
             if detect:
                 full_scan = (
-                    tracker.current_bbox is None
+                    not tracker.current_bboxes
                     or scene_cut
                     or index % max(1, int(tracking.full_scan_interval)) == 0
                 )
-                faces, _ = analyzer.analyze(frame, tracker.current_bbox, full_scan)
+                previous_regions = tracker.current_bbox
+                if bool(
+                    getattr(analyzer, "supports_multiple_previous_bboxes", False)
+                ) and tracker.current_bboxes:
+                    previous_regions = tracker.current_bboxes
+                faces, _ = analyzer.analyze(frame, previous_regions, full_scan)
                 scored = sorted(
                     (
                         (cosine_similarity(face.embedding, target_embedding), face)
@@ -129,7 +164,7 @@ def analyze_target_track(
                 )
                 if scored:
                     similarity = float(scored[0][0])
-                    if len(scored) > 1:
+                    if max_target_faces == 1 and len(scored) > 1:
                         second = float(scored[1][0])
                         ambiguous = (
                             similarity >= tracker.min_similarity
@@ -137,19 +172,36 @@ def analyze_target_track(
                             and similarity - second < ambiguity_margin
                         )
                     if not ambiguous:
-                        selected = tracker.select_detected(frame, gray, [item[1] for item in scored])
+                        selected = tracker.select_all_detected(
+                            frame,
+                            gray,
+                            [item[1] for item in scored],
+                        )
                     else:
-                        tracker.mark_missing(gray)  # evita fijar el rostro equivocado
+                        tracker.select_all_detected(frame, gray, [])
                 else:
-                    tracker.mark_missing(gray)
+                    tracker.select_all_detected(frame, gray, [])
             else:
-                selected = tracker.propagate(frame, gray)
-                if selected is not None and getattr(selected, "embedding", None) is not None:
-                    similarity = float(cosine_similarity(selected.embedding, target_embedding))
+                selected = tracker.propagate_all(frame, gray)
+                if tracker.needs_redetect:
+                    previous_regions = tracker.current_bbox
+                    if bool(
+                        getattr(analyzer, "supports_multiple_previous_bboxes", False)
+                    ) and tracker.current_bboxes:
+                        previous_regions = tracker.current_bboxes
+                    faces, _ = analyzer.analyze(frame, previous_regions, True)
+                    selected = tracker.select_all_detected(frame, gray, faces)
+                similarities = [
+                    cosine_similarity(face.embedding, target_embedding)
+                    for face in selected
+                    if getattr(face, "embedding", None) is not None
+                ]
+                if similarities:
+                    similarity = float(max(similarities))
 
             if ambiguous:
                 ambiguous_count += 1
-            if selected is None:
+            if not selected:
                 result.append(
                     TargetTrackFrame(
                         index=index,
@@ -161,17 +213,40 @@ def analyze_target_track(
                 )
             else:
                 selected_count += 1
-                yaw, pitch = estimate_pose_from_five_points(selected.kps)
+                instances = []
+                for face in selected:
+                    yaw, pitch = estimate_pose_from_five_points(face.kps)
+                    face_similarity = (
+                        float(cosine_similarity(face.embedding, target_embedding))
+                        if getattr(face, "embedding", None) is not None
+                        else 0.0
+                    )
+                    instances.append(
+                        TargetFaceInstance(
+                            bbox=tuple(float(value) for value in face.bbox),
+                            kps=tuple(
+                                tuple(float(v) for v in point) for point in face.kps
+                            ),
+                            yaw=yaw,
+                            pitch=pitch,
+                            similarity=face_similarity,
+                        )
+                    )
+                primary = max(
+                    instances,
+                    key=lambda item: bbox_area(np.asarray(item.bbox, dtype=np.float32)),
+                )
                 result.append(
                     TargetTrackFrame(
                         index=index,
-                        bbox=tuple(float(value) for value in selected.bbox),
-                        kps=tuple(tuple(float(v) for v in point) for point in selected.kps),
-                        yaw=yaw,
-                        pitch=pitch,
-                        similarity=similarity,
+                        bbox=primary.bbox,
+                        kps=primary.kps,
+                        yaw=primary.yaw,
+                        pitch=primary.pitch,
+                        similarity=max(item.similarity for item in instances),
                         ambiguous=False,
                         scene_cut=scene_cut,
+                        instances=tuple(instances),
                     )
                 )
             index += 1
@@ -224,7 +299,11 @@ def _flow_warp_mask(previous_gray: np.ndarray, gray: np.ndarray, mask: np.ndarra
     return cv2.resize(warped_small, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
-def _face_mask(shape: tuple[int, int], track: TargetTrackFrame, expand: float) -> np.ndarray:
+def _face_mask(
+    shape: tuple[int, int],
+    track: TargetTrackFrame | TargetFaceInstance,
+    expand: float,
+) -> np.ndarray:
     h, w = shape
     mask = np.zeros((h, w), dtype=np.float32)
     if track.bbox is None:
@@ -329,7 +408,12 @@ class TargetAwareCompositor:
             self.previous_mask = np.zeros(original.shape[:2], dtype=np.float32)
             return original.copy(), self.previous_mask.copy(), self.previous_mask.copy()
 
-        current = _face_mask(original.shape[:2], track, self.mask_expand)
+        current = np.zeros(original.shape[:2], dtype=np.float32)
+        for instance in track.all_instances():
+            current = np.maximum(
+                current,
+                _face_mask(original.shape[:2], instance, self.mask_expand),
+            )
         if self.previous_gray is not None and self.previous_mask is not None:
             warped = _flow_warp_mask(self.previous_gray, gray, self.previous_mask)
             current = (

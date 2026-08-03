@@ -22,7 +22,7 @@ from .parallel_pipeline import run_parallel_frames
 from .provenance import embed_c2pa_manifest, write_manifest
 from .quality_visual import write_visual_comparison_sheet
 from .restorer import build_face_restorer
-from .tracking import TemporalFaceTracker
+from .tracking import MultiFaceTracker
 from .videoio import (
     RawFFmpegWriter,
     mux_original_audio,
@@ -290,12 +290,13 @@ def _run_frame_pipeline(
         target_reference,
         config.identity.source_min_score,
     )
-    tracker = TemporalFaceTracker(
+    tracker = MultiFaceTracker(
         target_embedding,
         config.identity.target_min_similarity,
         config.tracking.smoothing,
         config.tracking.max_missing_frames,
         config.tracking.scene_cut_threshold,
+        max_faces=config.tracking.max_target_faces,
         optical_flow=config.tracking.optical_flow,
         flow_win_size=config.tracking.flow_win_size,
         flow_max_level=config.tracking.flow_max_level,
@@ -317,6 +318,7 @@ def _run_frame_pipeline(
         f"postproceso={models.capabilities.geometry_postprocess}, "
         f"decoder={reader.backend}, "
         f"detección cada {config.tracking.detection_interval} frames, "
+        f"objetivos simultáneos={config.tracking.max_target_faces}, "
         f"blend ROI={'sí' if config.blend.roi_enabled else 'no'}, "
         f"marca visible={'sí' if config.provenance.visible_disclosure else 'no'}"
     )

@@ -1,7 +1,7 @@
 import numpy as np
 
 from faceswap_pro.modeling import FaceData
-from faceswap_pro.tracking import TemporalFaceTracker
+from faceswap_pro.tracking import MultiFaceTracker, TemporalFaceTracker
 
 
 def test_tracker_returns_safe_face_clone():
@@ -69,3 +69,48 @@ def test_tracker_propagates_landmarks_with_optical_flow():
 
     assert propagated is not None
     assert np.allclose(propagated.kps, kps + [4, 2], atol=1.5)
+
+
+def test_multi_tracker_keeps_actor_and_mirror_reflection_as_separate_tracks():
+    reference = np.array([1.0, 0.0], dtype=np.float32)
+    tracker = MultiFaceTracker(
+        reference_embedding=reference,
+        min_similarity=0.5,
+        smoothing=0.5,
+        max_missing_frames=3,
+        scene_cut_threshold=1.1,
+        max_faces=2,
+        optical_flow=False,
+    )
+
+    def face(x1):
+        return FaceData(
+            bbox=np.array([x1, 12, x1 + 30, 52], dtype=np.float32),
+            kps=np.array(
+                [
+                    [x1 + 9, 26],
+                    [x1 + 21, 26],
+                    [x1 + 15, 35],
+                    [x1 + 10, 45],
+                    [x1 + 20, 45],
+                ],
+                dtype=np.float32,
+            ),
+            embedding=reference.copy(),
+            det_score=0.99,
+        )
+
+    frame1 = np.zeros((80, 140, 3), dtype=np.uint8)
+    selected1 = tracker.select(frame1, [face(10), face(92)])
+
+    frame2 = np.full_like(frame1, 1)
+    gray2, _ = tracker.observe(frame2)
+    # El detector puede cambiar el orden entre frames; la asociación no debe cruzar
+    # ni promediar el rostro directo con la reflexión.
+    selected2 = tracker.select_all_detected(frame2, gray2, [face(89), face(13)])
+
+    assert len(selected1) == 2
+    assert len(selected2) == 2
+    centers = sorted(float((item.bbox[0] + item.bbox[2]) * 0.5) for item in selected2)
+    assert centers[0] < 35
+    assert centers[1] > 100

@@ -86,3 +86,12 @@ def test_windows_setup_installs_insightface_without_cpu_onnxruntime_dependency()
     assert '"--no-deps", "insightface==1.0.1"' in script
     assert '"--no-deps", "-e", "."' in script
     assert '"onnxruntime-gpu[cuda,cudnn]==$OnnxRuntimeVersion"' in script
+
+
+def test_windows_setup_uses_windows_safe_hififace_auxiliary_directory():
+    script = Path("scripts/setup_windows.ps1").read_text(encoding="utf-8-sig")
+
+    assert "models\\hififace\\auxiliary\\Deep3DFaceRecon" in script
+    assert "models\\hififace\\auxiliary\\arcface" in script
+    assert "models\\hififace\\auxiliary\\BFM" in script
+    assert "models\\hififace\\aux\\" not in script

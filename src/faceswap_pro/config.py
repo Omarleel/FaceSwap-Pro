@@ -36,6 +36,7 @@ class TrackingConfig:
     detection_interval: int
     full_scan_interval: int
     max_recognition_candidates: int
+    max_target_faces: int
     optical_flow: bool
     flow_win_size: int
     flow_max_level: int
@@ -167,6 +168,13 @@ def load_config(path: Path) -> AppConfig:
             "performance.decoder debe ser auto, opencv, ffmpeg o ffmpeg_cuda."
         )
 
+    engine_max_faces = _positive_int(engine.get("max_faces", 10), 10)
+    max_target_faces = _positive_int(tracking.get("max_target_faces", 2), 2)
+    if max_target_faces > engine_max_faces:
+        raise ValueError(
+            "tracking.max_target_faces no puede superar engine.max_faces."
+        )
+
     return AppConfig(
         engine=EngineConfig(
             backend=backend,
@@ -176,7 +184,7 @@ def load_config(path: Path) -> AppConfig:
             providers=list(engine.get("providers", ["CPUExecutionProvider"])),
             cuda=dict(engine.get("cuda", {})),
             allowed_modules=allowed_modules,
-            max_faces=_positive_int(engine.get("max_faces", 10), 10),
+            max_faces=engine_max_faces,
             options=dict(engine.get("options", {})),
             plugins=tuple(str(value) for value in engine.get("plugins", [])),
         ),
@@ -194,6 +202,7 @@ def load_config(path: Path) -> AppConfig:
             max_recognition_candidates=_positive_int(
                 tracking.get("max_recognition_candidates", 2), 2
             ),
+            max_target_faces=max_target_faces,
             optical_flow=bool(tracking.get("optical_flow", True)),
             flow_win_size=_positive_int(tracking.get("flow_win_size", 31), 31, 5),
             flow_max_level=_positive_int(tracking.get("flow_max_level", 3), 3, 0),

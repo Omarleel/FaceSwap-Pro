@@ -226,6 +226,12 @@ class MeshAssistedAnalyzer(FaceAnalyzer):
         self._base = base
         self._estimator = estimator
 
+    @property
+    def supports_multiple_previous_bboxes(self) -> bool:
+        return bool(
+            getattr(self._base, "supports_multiple_previous_bboxes", False)
+        )
+
     def _enrich(self, image: np.ndarray, faces: list[FaceData]) -> list[FaceData]:
         enriched: list[FaceData] = []
         for face in faces:

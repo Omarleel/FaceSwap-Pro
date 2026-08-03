@@ -64,6 +64,25 @@ class SelectiveFaceAnalyzer:
     def _quality_score(face) -> float:
         return bbox_area(face.bbox) * float(face.det_score or 0.0)
 
+    @staticmethod
+    def _previous_bboxes(previous_bbox) -> list[np.ndarray]:
+        if previous_bbox is None:
+            return []
+        value = np.asarray(previous_bbox, dtype=np.float32)
+        if value.ndim == 1 and value.size == 4:
+            return [value.reshape(4)]
+        if value.ndim == 2 and value.shape[1] == 4:
+            return [row.copy() for row in value]
+        # ``MultiFaceTracker.current_bboxes`` devuelve una tupla de arrays. La
+        # conversión anterior cubre el caso normal; este fallback produce un error
+        # claro para integraciones con estructuras heterogéneas.
+        result = []
+        for item in previous_bbox:
+            bbox = np.asarray(item, dtype=np.float32).reshape(-1)
+            if bbox.size == 4:
+                result.append(bbox.copy())
+        return result
+
     def analyze(
         self,
         frame: np.ndarray,
@@ -85,20 +104,56 @@ class SelectiveFaceAnalyzer:
                 )
             )
 
-        if full_scan or previous_bbox is None:
+        previous_bboxes = self._previous_bboxes(previous_bbox)
+        if full_scan or not previous_bboxes:
             faces = sorted(detected_faces, key=self._quality_score, reverse=True)[
                 : self.max_faces
             ]
             candidates = faces
         else:
-            faces = sorted(
-                detected_faces,
-                key=lambda face: self._continuity_score(
-                    face, previous_bbox, frame.shape
-                ),
-                reverse=True,
-            )[: self.max_faces]
-            candidates = faces[: self.max_recognition_candidates]
+            faces = sorted(detected_faces, key=self._quality_score, reverse=True)[
+                : self.max_faces
+            ]
+            candidate_limit = min(
+                self.max_faces,
+                max(self.max_recognition_candidates, len(previous_bboxes)),
+            )
+
+            # Reserva primero un candidato distinto por trayectoria. Así el rostro
+            # real y su reflejo no compiten por un único cupo de reconocimiento.
+            candidates = []
+            used: set[int] = set()
+            for previous in previous_bboxes:
+                ranked = sorted(
+                    (
+                        (
+                            self._continuity_score(face, previous, frame.shape),
+                            index,
+                            face,
+                        )
+                        for index, face in enumerate(faces)
+                        if index not in used
+                    ),
+                    key=lambda item: item[0],
+                    reverse=True,
+                )
+                if not ranked:
+                    break
+                _, index, face = ranked[0]
+                used.add(index)
+                candidates.append(face)
+                if len(candidates) >= candidate_limit:
+                    break
+
+            # Los cupos restantes se llenan por calidad. Esto permite descubrir una
+            # reflexión que acaba de entrar en el encuadre sin esperar al full scan.
+            for index, face in enumerate(faces):
+                if len(candidates) >= candidate_limit:
+                    break
+                if index in used:
+                    continue
+                used.add(index)
+                candidates.append(face)
 
         for face in candidates:
             self.recognizer.get(frame, face)
@@ -158,6 +213,8 @@ def _to_insightface_face(face: FaceData):
 
 class InsightFaceAnalyzer:
     """Adaptador que oculta FaceAnalysis y la optimización selectiva."""
+
+    supports_multiple_previous_bboxes = True
 
     def __init__(self, face_app: Any, max_faces: int, max_recognition_candidates: int) -> None:
         self._face_app = face_app

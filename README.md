@@ -26,6 +26,7 @@ FaceAnalyzer ───────────────┐
                            ├─► tracking y selección de identidad
 FaceGenerator / FaceSwapper┘
         │
+        ├─ tracking multiinstancia (actor + reflejos)
         ├─ INSwapper 128
         ├─ INSwapper + postproceso por malla
         └─ HifiFace + extractor 3DMM + Semantic Facial Fusion
@@ -73,6 +74,9 @@ python -m pip install -e ".[mesh]"
 La integración usa la implementación externa MIT `xuehy/HiFiFace-pytorch`. El código
 y los pesos no se redistribuyen dentro de este ZIP.
 
+Los recursos auxiliares se guardan en `models/hififace/auxiliary`; no se usa
+un directorio llamado `aux`, porque `AUX` es un nombre reservado en Windows.
+
 1. Instala juntos una build CUDA de PyTorch y su `torchvision` compatible con tu controlador y GPU.
 2. Instala las dependencias de soporte:
 
@@ -102,7 +106,7 @@ git -C .\third_party\HiFiFace-pytorch checkout --force
 models/hififace/
 ├── standard_model/
 │   └── generator_320000.pth
-└── aux/
+└── auxiliary/
     ├── Deep3DFaceRecon/epoch_20_new.pth
     ├── arcface/ms1mv3_arcface_r100_fp16_backbone.pth
     └── BFM/
@@ -153,7 +157,9 @@ El backend divide vídeos largos en ventanas `4n+1` solapadas, desplaza frontera
 cortes de escena y mantiene el runtime cargado mediante un worker persistente. Un
 fallback automático conserva compatibilidad con la CLI oficial. La referencia
 objetivo se usa para seguir a la persona correcta y la salida se recompone sobre el
-vídeo original únicamente dentro de su máscara temporal.
+vídeo original únicamente dentro de sus máscaras temporales. Si la misma identidad
+aparece directamente y reflejada en un espejo, ambas regiones se incluyen en la
+composición.
 
 Cada ejecución temporal genera también métricas JSON, una hoja visual entrada/salida,
 hashes cacheados de modelos y C2PA opcional. Consulta
@@ -180,6 +186,26 @@ faceswap-pro run --config .\config\quality_3dmm.yaml
 ```
 
 `quality_3d.yaml` es un alias legible del perfil `quality_3dmm.yaml`.
+
+## Espejos y varias apariciones del sujeto
+
+Todos los perfiles incluidos permiten dos apariciones simultáneas de la identidad
+objetivo mediante:
+
+```yaml
+tracking:
+  max_target_faces: 2
+```
+
+Cada aparición mantiene una trayectoria, suavizado y flujo óptico independientes;
+el orden cambiante del detector no mezcla el rostro directo con su reflexión. En el
+pipeline por fotogramas se genera y compone un reemplazo por rostro. En DreamID-V se
+construye la unión de máscaras de todas las apariciones coincidentes para conservar
+la salida generada en ambas zonas.
+
+Usa `max_target_faces: 1` para recuperar el comportamiento conservador anterior, o
+un valor mayor cuando una escena contenga varios espejos. El límite se aplica solo a
+rostros cuya similitud supere `identity.target_min_similarity`.
 
 ## Rutas personalizadas
 
@@ -216,9 +242,10 @@ la consistencia temporal neuronal queda como una extensión separada futura.
 pytest -q
 ```
 
-La suite cubre contratos, configuración, tracking, ventanas DreamID-V solapadas,
-banco multi-referencia, composición selectiva, métricas visuales, caché de hashes,
-C2PA, compatibilidad del flujo anterior, HifiFace y el adaptador 3DMM.
+La suite cubre contratos, configuración, tracking multiinstancia y reflejos,
+ventanas DreamID-V solapadas, banco multi-referencia, composición selectiva,
+métricas visuales, caché de hashes, C2PA, compatibilidad del flujo anterior,
+HifiFace y el adaptador 3DMM.
 
 ## Uso responsable
 

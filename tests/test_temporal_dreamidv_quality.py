@@ -13,6 +13,7 @@ from faceswap_pro.identity import SourceReferenceSample, select_diverse_source_r
 from faceswap_pro.modeling import FaceData
 from faceswap_pro.temporal_video import (
     TargetAwareCompositor,
+    TargetFaceInstance,
     TargetTrackFrame,
     analyze_target_track,
 )
@@ -208,3 +209,65 @@ def test_target_tracking_rejects_ambiguous_person_without_switching(monkeypatch)
     assert track.frames[1].ambiguous is True
     assert track.frames[1].bbox is None
     assert track.frames[2].bbox is not None
+
+
+def test_target_tracking_accepts_actor_and_mirror_when_multi_target_is_enabled(
+    monkeypatch,
+):
+    frames = [np.full((72, 96, 3), 40 + i, dtype=np.uint8) for i in range(3)]
+    monkeypatch.setattr(
+        "faceswap_pro.temporal_video.cv2.VideoCapture",
+        lambda path: _Capture(frames),
+    )
+    tracking = SimpleNamespace(
+        smoothing=0.0,
+        max_missing_frames=2,
+        scene_cut_threshold=1.0,
+        optical_flow=False,
+        flow_win_size=31,
+        flow_max_level=3,
+        flow_max_error=25.0,
+        detection_interval=1,
+        full_scan_interval=1,
+        max_target_faces=2,
+    )
+
+    track = analyze_target_track(
+        Path("proxy.mkv"),
+        _SequenceAnalyzer(),
+        np.array([1.0, 0.0], dtype=np.float32),
+        tracking,
+        fps=16,
+        min_similarity=0.3,
+        ambiguity_margin=0.05,
+    )
+
+    assert track.coverage == pytest.approx(1.0)
+    assert track.ambiguous_ratio == pytest.approx(0.0)
+    assert [len(frame.all_instances()) for frame in track.frames] == [1, 2, 1]
+    assert track.as_dict()["max_target_faces"] == 2
+
+
+def test_target_aware_compositor_builds_union_mask_for_mirror_reflection():
+    original = np.full((120, 180, 3), 30, dtype=np.uint8)
+    generated = np.full_like(original, 220)
+    direct = TargetFaceInstance(bbox=(20.0, 25.0, 70.0, 95.0))
+    reflection = TargetFaceInstance(bbox=(110.0, 30.0, 155.0, 92.0))
+    track = TargetTrackFrame(
+        index=0,
+        bbox=direct.bbox,
+        instances=(direct, reflection),
+    )
+    compositor = TargetAwareCompositor(
+        temporal_smoothing=0.0,
+        occlusion_strength=0.0,
+        color_match=False,
+    )
+
+    output, alpha, _ = compositor.compose(original, generated, track)
+
+    assert alpha[58, 45] > 0.5
+    assert alpha[58, 132] > 0.5
+    assert alpha[10, 90] == 0.0
+    assert not np.array_equal(output[58, 45], original[58, 45])
+    assert not np.array_equal(output[58, 132], original[58, 132])

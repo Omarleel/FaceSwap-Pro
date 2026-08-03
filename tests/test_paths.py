@@ -38,3 +38,10 @@ def test_manifest_path_is_separate_from_video(tmp_path):
     output = tmp_path / "outputs/videos/render.mp4"
     manifest = build_manifest_path(output, tmp_path / "outputs/manifests")
     assert manifest == tmp_path / "outputs/manifests/render.manifest.json"
+
+
+def test_hififace_uses_windows_safe_auxiliary_directory(tmp_path):
+    create_project_directories(tmp_path)
+
+    assert (tmp_path / "models/hififace/auxiliary").is_dir()
+    assert not (tmp_path / "models/hififace/aux").exists()

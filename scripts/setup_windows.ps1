@@ -325,9 +325,9 @@ Write-Step "Preparando directorios del proyecto"
     "inputs\target_faces",
     "models",
     "models\hififace\standard_model",
-    "models\hififace\aux\Deep3DFaceRecon",
-    "models\hififace\aux\arcface",
-    "models\hififace\aux\BFM",
+    "models\hififace\auxiliary\Deep3DFaceRecon",
+    "models\hififace\auxiliary\arcface",
+    "models\hififace\auxiliary\BFM",
     "third_party",
     "outputs\videos",
     "outputs\manifests"

@@ -17,7 +17,7 @@ PROJECT_DIRECTORIES = (
     Path("inputs/target_faces"),
     Path("models"),
     Path("models/hififace/standard_model"),
-    Path("models/hififace/aux"),
+    Path("models/hififace/auxiliary"),
     Path("models/dreamidv"),
     Path("third_party"),
     DEFAULT_OUTPUT_DIR,

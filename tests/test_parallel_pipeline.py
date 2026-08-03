@@ -5,7 +5,7 @@ import numpy as np
 from faceswap_pro.blend import ProfessionalBlender
 from faceswap_pro.modeling import DetectionStats, FaceData, SwapResult
 from faceswap_pro.parallel_pipeline import run_parallel_frames
-from faceswap_pro.tracking import TemporalFaceTracker
+from faceswap_pro.tracking import MultiFaceTracker, TemporalFaceTracker
 from faceswap_pro.videoio import VideoMetadata
 
 
@@ -129,3 +129,103 @@ def test_parallel_pipeline_preserves_order_and_processes_all_frames():
     assert len(writer.frames) == 6
     assert [int(frame[-1, -1, 0]) for frame in writer.frames] == list(range(6))
     assert settings["postprocess_workers"] == 2
+
+
+class MirrorAnalyzer:
+    def find_faces(self, image):
+        return []
+
+    @staticmethod
+    def _face(x1):
+        return FaceData(
+            bbox=np.array([x1, 22, x1 + 30, 62], dtype=np.float32),
+            kps=np.array(
+                [
+                    [x1 + 9, 34],
+                    [x1 + 21, 34],
+                    [x1 + 15, 44],
+                    [x1 + 10, 55],
+                    [x1 + 20, 55],
+                ],
+                dtype=np.float32,
+            ),
+            det_score=0.99,
+            embedding=np.array([1.0, 0.0], dtype=np.float32),
+        )
+
+    def analyze(self, frame, previous_bbox, full_scan):
+        del frame, previous_bbox
+        faces = [self._face(18), self._face(78)]
+        return faces, DetectionStats(detected=2, recognized=2, full_scan=full_scan)
+
+
+class CountingSwapper(DummySwapper):
+    def __init__(self):
+        self.targets = []
+
+    def swap(self, frame, target_face, source_face):
+        self.targets.append(target_face.bbox.copy())
+        return super().swap(frame, target_face, source_face)
+
+
+def test_parallel_pipeline_swaps_actor_and_mirror_reflection_in_every_frame():
+    reader = DummyReader(count=4)
+    writer = DummyWriter()
+    tracker = MultiFaceTracker(
+        reference_embedding=np.array([1.0, 0.0], dtype=np.float32),
+        min_similarity=0.5,
+        smoothing=0.0,
+        max_missing_frames=2,
+        scene_cut_threshold=1.1,
+        max_faces=2,
+        optical_flow=False,
+    )
+    blender = ProfessionalBlender(
+        aligned_size=16,
+        mask_shrink=0.8,
+        mask_blur_ratio=0.1,
+        color_match_strength=0.0,
+        detail_strength=0.0,
+        roi_enabled=True,
+        roi_margin=0.1,
+        interpolation="linear",
+    )
+    config = SimpleNamespace(
+        performance=SimpleNamespace(
+            reader_queue=2,
+            analysis_queue=2,
+            writer_queue=2,
+            max_inflight=3,
+            postprocess_workers=2,
+            opencv_threads=1,
+        ),
+        restorer=SimpleNamespace(enabled=False),
+        engine=SimpleNamespace(max_faces=3),
+        tracking=SimpleNamespace(
+            max_recognition_candidates=2,
+            max_target_faces=2,
+            detection_interval=1,
+            full_scan_interval=2,
+            optical_flow=False,
+        ),
+        provenance=SimpleNamespace(visible_disclosure=False),
+    )
+    swapper = CountingSwapper()
+
+    stats, settings = run_parallel_frames(
+        reader=reader,
+        writer=writer,
+        analyzer=MirrorAnalyzer(),
+        swapper=swapper,
+        source_face=object(),
+        tracker=tracker,
+        blender=blender,
+        restorer=IdentityRestorer(),
+        config=config,
+    )
+
+    assert stats.written_frames == 4
+    assert stats.swapped_frames == 4
+    assert stats.swapped_faces == 8
+    assert len(swapper.targets) == 8
+    assert settings["max_target_faces"] == 2
