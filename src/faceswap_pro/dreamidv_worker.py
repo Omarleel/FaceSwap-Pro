@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-"""Worker persistente ejecutado dentro del entorno aislado de DreamID-V.
+"""Worker persistente de DreamID-V ejecutado después de liberar DWPose.
 
 El protocolo es JSON Lines por stdin. Cada respuesta comienza con
 ``FACESWAP_RESULT `` para poder convivir con los logs del runtime oficial.
 """
 
 import argparse
+import gc
 import importlib
 import json
 import os
@@ -35,7 +36,6 @@ class WorkerRuntime:
     def __init__(self, args: argparse.Namespace) -> None:
         repository = args.repository.expanduser().resolve()
         sys.path.insert(0, str(repository))
-        sys.path.insert(0, str(repository / "pose"))
         self.args = args
         self.repository = repository
         package_name = "dreamidv_wan_faster" if args.variant == "faster" else "dreamidv_wan"
@@ -57,21 +57,38 @@ class WorkerRuntime:
             use_usp=False,
             t5_cpu=args.t5_cpu,
         )
-        from pose.extract import process_dwpose
 
-        self.process_dwpose = process_dwpose
+    @staticmethod
+    def _release_transient_cuda_memory() -> None:
+        """Libera tensores temporales sin descargar el modelo persistente."""
+
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                # ipc_collect puede no estar disponible en todas las builds.
+                ipc_collect = getattr(torch.cuda, "ipc_collect", None)
+                if callable(ipc_collect):
+                    ipc_collect()
+        except Exception:  # pragma: no cover - limpieza de mejor esfuerzo
+            pass
 
     def generate(self, request: dict[str, Any]) -> None:
         input_video = Path(request["input_video"]).resolve()
         source_reference = Path(request["source_reference"]).resolve()
         output_video = Path(request["output_video"]).resolve()
+        pose_path = Path(request["pose_video"]).resolve()
+        mask_path = Path(request["mask_video"]).resolve()
         output_video.parent.mkdir(parents=True, exist_ok=True)
-        temp_dir = input_video.parent / f"{input_video.stem}_dreamidv_pose"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        pose_path = temp_dir / "pose.mp4"
-        mask_path = temp_dir / "mask.mp4"
-        if not pose_path.is_file() or not mask_path.is_file():
-            self.process_dwpose(str(input_video), str(pose_path), str(mask_path))
+
+        missing = [str(path) for path in (pose_path, mask_path) if not path.is_file()]
+        if missing:
+            raise RuntimeError(
+                "Faltan artefactos DWPose precalculados: " + ", ".join(missing)
+            )
 
         if self.args.variant == "faster":
             ref_paths = [str(input_video), str(mask_path), str(source_reference)]
@@ -82,26 +99,32 @@ class WorkerRuntime:
                 str(source_reference),
                 str(pose_path),
             ]
-        video = self.pipeline.generate(
-            "chang face",
-            ref_paths,
-            size=self.size_configs[self.args.size],
-            frame_num=int(request["frame_num"]),
-            shift=float(request["sample_shift"]),
-            sample_solver=str(request["sample_solver"]),
-            sampling_steps=int(request["sample_steps"]),
-            guide_scale_img=float(request["guide_scale"]),
-            seed=int(request["seed"]),
-            offload_model=bool(request["offload_model"]),
-        )
-        self.cache_video(
-            tensor=video[None],
-            save_file=str(output_video),
-            fps=self.cfg.sample_fps,
-            nrow=1,
-            normalize=True,
-            value_range=(-1, 1),
-        )
+
+        video = None
+        try:
+            video = self.pipeline.generate(
+                "chang face",
+                ref_paths,
+                size=self.size_configs[self.args.size],
+                frame_num=int(request["frame_num"]),
+                shift=float(request["sample_shift"]),
+                sample_solver=str(request["sample_solver"]),
+                sampling_steps=int(request["sample_steps"]),
+                guide_scale_img=float(request["guide_scale"]),
+                seed=int(request["seed"]),
+                offload_model=bool(request["offload_model"]),
+            )
+            self.cache_video(
+                tensor=video[None],
+                save_file=str(output_video),
+                fps=self.cfg.sample_fps,
+                nrow=1,
+                normalize=True,
+                value_range=(-1, 1),
+            )
+        finally:
+            del video
+            self._release_transient_cuda_memory()
 
 
 def _reply(payload: dict[str, Any]) -> None:
@@ -130,6 +153,7 @@ def main() -> int:
             runtime.generate(request)
             _reply({"ok": True, "output_video": request["output_video"]})
         except Exception as exc:  # noqa: BLE001 - protocolo de proceso externo
+            WorkerRuntime._release_transient_cuda_memory()
             traceback.print_exc()
             _reply({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
     return 0

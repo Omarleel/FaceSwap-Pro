@@ -224,3 +224,130 @@ def test_pipeline_dispatches_video_backend_and_builds_512_reference(tmp_path, mo
     assert result == output
     assert manifest.is_file()
     assert processor.reference_shape == (512, 512, 3)
+
+
+def test_dreamidv_defaults_isolate_gpu_phases(tmp_path):
+    options = DreamIDVOptions.from_config(_config(tmp_path, persistent_worker=True))
+
+    assert options.precompute_pose is True
+    assert options.worker_restart_attempts == 1
+    assert options.release_analysis_gpu is True
+
+
+def test_persistent_pipeline_closes_pose_worker_before_loading_wan(tmp_path, monkeypatch):
+    events: list[str] = []
+    options = DreamIDVOptions.from_config(
+        _config(
+            tmp_path,
+            persistent_worker=True,
+            precompute_pose=True,
+            worker_restart_attempts=1,
+            worker_fallback=False,
+            release_analysis_gpu=True,
+        )
+    )
+    checkpoint = tmp_path / "dreamidv_faster.pth"
+    checkpoint.write_bytes(b"checkpoint")
+    input_video = tmp_path / "input.mp4"
+    input_video.write_bytes(b"input")
+    source_reference = tmp_path / "reference.png"
+    source_reference.write_bytes(b"reference")
+    output_video = tmp_path / "output.mp4"
+
+    metadata = VideoMetadata(fps=16.0, width=832, height=480, frame_count=100)
+    monkeypatch.setattr("faceswap_pro.dreamidv_backend.select_ffmpeg", lambda: Path("ffmpeg"))
+    monkeypatch.setattr("faceswap_pro.dreamidv_backend.probe_video", lambda path: metadata)
+    monkeypatch.setattr(
+        "faceswap_pro.dreamidv_backend.probe_video_color",
+        lambda path: SimpleNamespace(
+            hdr=False,
+            pixel_format="yuv420p",
+            color_primaries="bt709",
+            color_transfer="bt709",
+            color_space="bt709",
+            color_range="tv",
+        ),
+    )
+
+    class FakePoseClient:
+        def __init__(self, received_options):
+            assert received_options is options
+            events.append("pose-start")
+
+        def generate(self, *, input_video, pose_video, mask_video):
+            assert input_video.is_file()
+            pose_video.parent.mkdir(parents=True, exist_ok=True)
+            pose_video.write_bytes(b"pose")
+            mask_video.write_bytes(b"mask")
+            events.append(f"pose-{input_video.stem}")
+
+        def close(self):
+            events.append("pose-close")
+
+    class FakeDreamClient:
+        def __init__(self, received_options, received_checkpoint):
+            assert received_options is options
+            assert received_checkpoint == checkpoint
+            assert events[-1] == "pose-close"
+            events.append("wan-start")
+
+        def generate(self, payload):
+            assert Path(payload["pose_video"]).is_file()
+            assert Path(payload["mask_video"]).is_file()
+            Path(payload["output_video"]).write_bytes(b"generated")
+            events.append("wan-generate")
+
+        def close(self):
+            events.append("wan-close")
+
+    monkeypatch.setattr("faceswap_pro.dreamidv_backend.DreamIDVPoseClient", FakePoseClient)
+    monkeypatch.setattr(
+        "faceswap_pro.dreamidv_backend.DreamIDVPersistentClient", FakeDreamClient
+    )
+
+    backend = DreamIDVSubprocessBackend(checkpoint, options)
+
+    def prepare_proxy(**kwargs):
+        kwargs["destination"].write_bytes(b"proxy")
+
+    def extract_chunk(**kwargs):
+        kwargs["destination"].write_bytes(b"source")
+
+    def stitch(**kwargs):
+        kwargs["output"].write_bytes(b"final")
+        return {"ok": True}
+
+    monkeypatch.setattr(backend, "_prepare_source_proxy", prepare_proxy)
+    monkeypatch.setattr(backend, "_extract_chunk", extract_chunk)
+    monkeypatch.setattr(backend, "_stitch_compose_encode", stitch)
+
+    result = backend.process(
+        SimpleNamespace(
+            input_video=input_video,
+            source_reference=source_reference,
+            output_video=output_video,
+            source_references=(),
+            target_embedding=None,
+            source_embedding=None,
+        )
+    )
+
+    assert output_video.is_file()
+    assert events.index("pose-close") < events.index("wan-start")
+    assert events.count("wan-generate") == 3
+    assert result.metadata["worker_restarts"] == 0
+    assert result.metadata["persistent_worker_fallback"] is False
+
+
+def test_dreamidv_worker_uses_precomputed_pose_and_releases_cuda_cache():
+    worker = Path("src/faceswap_pro/dreamidv_worker.py").read_text(encoding="utf-8")
+    pose_worker = Path("src/faceswap_pro/dreamidv_pose_worker.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'request["pose_video"]' in worker
+    assert 'request["mask_video"]' in worker
+    assert "process_dwpose" not in worker
+    assert "torch.cuda.empty_cache()" in worker
+    assert "torch.cuda.ipc_collect" not in worker  # se usa getattr por compatibilidad
+    assert "process_dwpose" in pose_worker

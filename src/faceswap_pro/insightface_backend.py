@@ -233,8 +233,32 @@ class InsightFaceAnalyzer:
         previous_bbox: np.ndarray | None,
         full_scan: bool,
     ) -> tuple[list[FaceData], DetectionStats]:
+        if self._face_app is None or self._selective is None:
+            raise RuntimeError("InsightFace ya liberó sus sesiones GPU.")
         faces, stats = self._selective.analyze(frame, previous_bbox, full_scan)
         return [_to_face_data(face) for face in faces], stats
+
+    def release_gpu_resources(self) -> None:
+        """Elimina sesiones ONNX después del tracking de un backend temporal."""
+
+        import gc
+
+        face_app = self._face_app
+        selective = self._selective
+        self._face_app = None
+        self._selective = None
+        if selective is not None:
+            selective.detector = None
+            selective.recognizer = None
+        if face_app is not None:
+            models = getattr(face_app, "models", None)
+            if hasattr(models, "clear"):
+                models.clear()
+            if hasattr(face_app, "det_model"):
+                face_app.det_model = None
+        del selective
+        del face_app
+        gc.collect()
 
 
 class InsightFaceSwapper:

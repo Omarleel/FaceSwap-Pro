@@ -25,12 +25,12 @@ engine:
     wan_checkpoint_dir: models/dreamidv/Wan2.1-T2V-1.3B
     python_executable: python
 
-    # Perfil equilibrado para RTX 5070 Ti de 16 GB.
+    # Perfil rápido para GPU de 16 GB. Reduce pasos y solape para pruebas largas.
     variant: faster
     size: "832*480"
     frame_num: 49
     sample_fps: 16
-    sample_steps: 16
+    sample_steps: 8
     sample_shift: 5.0
     sample_guide_scale_img: 4.0
     sample_solver: unipc
@@ -42,7 +42,7 @@ engine:
 
     # Ventanas solapadas y cortes de escena. Los intermedios son sin pérdida.
     chunking: true
-    chunk_overlap_frames: 17
+    chunk_overlap_frames: 9
     scene_aware_chunking: true
     scene_cut_window_frames: 12
     chunk_codec: libx264
@@ -72,7 +72,7 @@ engine:
     color_match: true
 
     # Métricas por ejecución y gestión explícita de HDR.
-    benchmark_enabled: true
+    benchmark_enabled: false
     benchmark_interval: 8
     hdr_policy: tonemap
 

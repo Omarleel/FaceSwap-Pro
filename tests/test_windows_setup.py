@@ -95,3 +95,15 @@ def test_windows_setup_uses_windows_safe_hififace_auxiliary_directory():
     assert "models\\hififace\\auxiliary\\arcface" in script
     assert "models\\hififace\\auxiliary\\BFM" in script
     assert "models\\hififace\\aux\\" not in script
+
+
+def test_dreamidv_setup_enables_torch_attention_fallback():
+    script = Path("scripts/setup_dreamidv_windows.ps1").read_text(encoding="utf-8-sig")
+
+    assert "function Enable-DreamIdVTorchAttentionFallback" in script
+    assert '"from .attention import flash_attention"' in script
+    assert '"from .attention import attention"' in script
+    assert '$updated.Replace("flash_attention(", "attention(")' in script
+    assert "Enable-DreamIdVTorchAttentionFallback" in script.split(
+        'Write-Step "Clonando o validando DreamID-V"', 1
+    )[1]

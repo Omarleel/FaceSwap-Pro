@@ -1,15 +1,14 @@
 # DreamID-V
 
-El backend `dreamid_v` procesa clips completos en un entorno Python aislado y deja
-el entorno principal para InsightFace, tracking, composición, codificación y
-proveniencia. Los pesos de DreamID-V y Wan no se redistribuyen en este proyecto.
+El backend `dreamid_v` procesa clips completos con DreamID-V Faster y Wan 2.1.
+Puede usar el mismo entorno Conda que FaceSwap-Pro, siempre que se instalen las
+dependencias de forma selectiva mediante `scripts/setup_dreamidv_windows.ps1`.
+Los pesos de DreamID-V y Wan no se redistribuyen en este proyecto.
 
 ## Estructura esperada
 
 ```text
 FaceSwap-Pro/
-├── .venv-dreamidv/
-│   └── Scripts/python.exe
 ├── third_party/DreamID-V/
 │   ├── generate_dreamidv_faster.py
 │   ├── dreamidv_wan_faster/context.pth
@@ -22,132 +21,150 @@ FaceSwap-Pro/
         └── ... checkpoint base ...
 ```
 
-## Preparación
+## Preparación en Windows
 
-1. Clona DreamID-V en `third_party/DreamID-V`.
-2. Crea un entorno separado e instala allí PyTorch CUDA y los requisitos del
-   checkout de DreamID-V.
-3. Comprueba que ese entorno importe también `decord`.
-4. Descarga el checkpoint DreamID-V, el checkpoint base Wan y los dos modelos
-   DWPose en las rutas del árbol anterior.
-5. Ejecuta:
+Con el entorno Conda `FaceSwap-Pro` activo:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass -Force
+.\scripts\setup_dreamidv_windows.ps1
+```
+
+El script:
+
+1. conserva PyTorch si CUDA ya funciona;
+2. deja una sola variante de OpenCV;
+3. deja únicamente `onnxruntime-gpu`;
+4. instala las dependencias compatibles de DreamID-V;
+5. clona DreamID-V y aplica el wrapper de atención de PyTorch/FlashAttention;
+6. descarga DreamID-V Faster, Wan 2.1 y DWPose;
+7. ejecuta el diagnóstico final.
+
+Comprueba manualmente:
 
 ```powershell
 faceswap-pro doctor --config .\config\quality_dreamidv.yaml
 ```
 
-El diagnóstico comprueba el checkout, los checkpoints, DWPose, FFmpeg, el bridge del
-worker persistente y las dependencias del entorno externo. También muestra el estado
-de `c2patool` cuando C2PA está habilitado.
+`configured_backend_ready` debe ser `true`.
 
 ## Ejecución
+
+Perfil de calidad:
 
 ```powershell
 faceswap-pro run `
   --input .\inputs\videos\input.mp4 `
   --source-dir .\inputs\source_faces `
   --target-ref .\inputs\target_faces\target.jpg `
-  --config .\config\quality_dreamidv.yaml
+  --config .\config\quality_dreamidv.yaml `
+  --output .\outputs\videos\resultado_dreamidv.mp4
 ```
 
-## Flujo implementado
+Perfil rápido para vídeos largos o validaciones:
 
-1. **Banco de identidad.** Analiza todas las fotos fuente, calcula un embedding
-   ponderado y conserva referencias izquierda, frontal y derecha según pose,
-   nitidez, exposición, tamaño y confianza de detección.
-2. **Proxy sin pérdida.** Normaliza la línea temporal a `sample_fps` usando
-   H.264 lossless 4:4:4 por defecto. En HDR aplica tonemapping explícito a BT.709,
-   o rechaza/pasa el material según `hdr_policy`.
-3. **Tracking del objetivo.** Compara cada rostro con `--target-ref`, mantiene un
-   track temporal y marca frames ambiguos cuando dos personas tienen similitud
-   demasiado próxima. En esos frames no aplica el reemplazo.
-4. **Ventanas solapadas.** Planifica clips `4n+1` con solapamiento. Cerca de un
-   corte de escena desplaza el inicio de ventana al corte y evita mezclar planos.
-5. **Worker persistente.** Para `faster` y `dwpose`, carga DreamID-V una vez y
-   procesa todos los clips mediante JSON Lines. Si falla y `worker_fallback` está
-   activo, vuelve a la CLI oficial por clip.
-6. **Stitching temporal.** Alinea las dos hipótesis del solapamiento al movimiento
-   del vídeo fuente y las mezcla con una curva cosenoidal. Las semillas se derivan
-   del frame absoluto para que el plan sea reproducible.
-7. **Composición selectiva.** Conserva el vídeo original fuera de la máscara del
-   sujeto objetivo, estabiliza esa máscara con flujo óptico, iguala color y restaura
-   oclusores probables como manos, cabello cruzado, gafas u objetos.
-8. **Codificación final real.** Aplica el bloque `encoding` del YAML y después
-   recupera el audio original. Ya no depende silenciosamente del códec interno usado
-   por DreamID-V.
-9. **Evaluación.** Escribe un JSON de métricas y una hoja JPEG entrada/salida con
-   muestras normalizadas de toda la línea temporal.
-10. **Proveniencia.** Crea manifiesto JSON con hashes cacheados y, cuando está
-    disponible, incrusta credenciales C2PA mediante `c2patool`.
-
-## Archivos de salida
-
-Para `video_faceswap_....mp4` se generan normalmente:
-
-```text
-outputs/videos/video_faceswap_....mp4
-outputs/manifests/video_faceswap_....manifest.json
-outputs/manifests/video_faceswap_....quality.json
-outputs/manifests/video_faceswap_....quality-contact-sheet.jpg
-outputs/manifests/video_faceswap_....c2pa-definition.json   # si C2PA se solicita
-outputs/manifests/.hash-cache/model-sha256.json
+```powershell
+faceswap-pro run `
+  --input .\inputs\videos\input.mp4 `
+  --source-dir .\inputs\source_faces `
+  --target-ref .\inputs\target_faces\target.jpg `
+  --config .\config\speed_dreamidv.yaml `
+  --output .\outputs\videos\resultado_dreamidv_rapido.mp4
 ```
 
-Las métricas incluyen similitud de identidad, error normalizado de landmarks,
-cambio fuera de máscara, delta temporal y salto relativo en fronteras de clips.
-Un valor `null` significa que no hubo suficientes muestras válidas, no que la
-métrica haya sido aprobada.
+El perfil rápido usa 8 pasos y 9 fotogramas de solape. Es más veloz, pero puede
+perder algo de detalle frente al perfil de 16 pasos.
 
-## Parámetros principales del perfil de 16 GB
+## Flujo de GPU optimizado
+
+1. **Banco de identidad y tracking.** InsightFace construye las referencias,
+   identifica al actor y mantiene hasta dos apariciones simultáneas para cubrir el
+   rostro directo y su reflexión.
+2. **Liberación de InsightFace.** Tras finalizar el tracking, el backend elimina
+   las sesiones ONNX de InsightFace antes de cargar los modelos pesados.
+3. **Fase DWPose aislada.** Todos los clips se extraen y se procesan con un worker
+   DWPose persistente. Los modelos ONNX se cargan una sola vez.
+4. **Cierre completo de DWPose.** El proceso se termina y Windows libera sus
+   buffers CUDA antes de iniciar Wan.
+5. **Fase DreamID-V persistente.** Wan y DreamID-V se cargan una vez. Cada clip usa
+   `pose.mp4` y `mask.mp4` precalculados, sin volver a inicializar DWPose.
+6. **Limpieza entre clips.** El worker elimina tensores temporales y ejecuta
+   `torch.cuda.empty_cache()` e `ipc_collect()` cuando están disponibles.
+7. **Reinicio controlado.** Si el worker falla, se cierra para liberar toda su VRAM
+   y se vuelve a crear según `worker_restart_attempts`. Con
+   `worker_fallback: false`, la ejecución se detiene en lugar de caer a una CLI
+   mucho más lenta.
+8. **Stitching y composición.** Las ventanas se mezclan en los solapes y el vídeo
+   original se conserva fuera de las máscaras del actor y su reflexión.
+
+## Parámetros de memoria
+
+```yaml
+persistent_worker: true
+precompute_pose: true
+worker_restart_attempts: 1
+worker_fallback: false
+release_analysis_gpu: true
+offload_model: true
+t5_cpu: true
+```
+
+En Windows se evita `expandable_segments`, porque varias builds de PyTorch no lo
+soportan. El backend usa `max_split_size_mb` y un umbral de recolección para reducir
+fragmentación.
+
+## Perfiles incluidos
+
+### `quality_dreamidv.yaml`
 
 ```yaml
 frame_num: 49
 sample_fps: 16
 sample_steps: 16
 chunk_overlap_frames: 17
-scene_aware_chunking: true
-chunk_crf: 0
-chunk_pix_fmt: yuv444p
-persistent_worker: true
-reference_bank_size: 6
-benchmark_enabled: true
-hdr_policy: tonemap
 ```
 
-`frame_num` debe tener forma `4n+1`. Para subir calidad, modifica una sola dimensión
-por prueba: primero pasos, luego `frame_num=81` o `size="1280*720"`. Combinar 720p y
-81 frames puede superar 16 GB según versiones, offloading y fragmentación de VRAM.
-
-## C2PA
-
-El perfil activa C2PA en modo no bloqueante:
+### `speed_dreamidv.yaml`
 
 ```yaml
-c2pa_enabled: true
-c2pa_required: false
-c2pa_tool: c2patool
+frame_num: 49
+sample_fps: 16
+sample_steps: 8
+chunk_overlap_frames: 9
+benchmark_enabled: false
 ```
 
-Sin `c2patool`, el vídeo sigue generándose y el manifiesto registra `skipped`. Para
-un flujo de entrega, instala `c2patool`, configura un certificado y una clave propios
-y usa `c2pa_required: true`:
+## Mensajes que no son errores
 
-```yaml
-c2pa_sign_cert: certificates/signing-cert.pem
-c2pa_private_key: certificates/signing-key.pem
-c2pa_required: true
+Estos avisos no bloquean por sí solos:
+
+- `FutureWarning` de `torch.cuda.amp.autocast`;
+- nodos ONNX asignados al CPU para operaciones de forma;
+- aviso de máscara de padding al usar SDPA.
+
+Sí debe detenerse la ejecución ante `CUDA out of memory`, archivos de máscara
+ausentes o un worker que agote sus reinicios.
+
+## Salidas
+
+```text
+outputs/videos/resultado_dreamidv.mp4
+outputs/manifests/resultado_dreamidv.manifest.json
+outputs/manifests/resultado_dreamidv.quality.json
+outputs/manifests/resultado_dreamidv.quality-contact-sheet.jpg
 ```
 
-La credencial de desarrollo de la herramienta sirve para pruebas, pero no representa
-una firma de producción confiable.
+Cuando `release_analysis_gpu: true`, las métricas que requieren volver a ejecutar
+InsightFace pueden quedar sin muestras; las métricas temporales, composición,
+fronteras y codificación siguen disponibles.
 
-## Límites honestos
+## Límites
 
-- El detector de oclusiones incluido es temporal y heurístico; no sustituye una red
-  semántica entrenada para manos, cabello, accesorios y transparencias.
-- La selección multi-referencia elige una imagen por clip. No modifica el modelo
-  DreamID-V para fusionar varias referencias dentro de una misma pasada.
-- El tracking evita cambiar a otra persona y conserva frames ambiguos originales,
-  pero planos con rostros muy pequeños o fuertemente ocultos pueden quedar sin swap.
-- Las métricas automáticas sirven para regresión y comparación A/B. La aceptación
-  final todavía requiere revisar el vídeo y la hoja visual.
+- DreamID-V Faster sigue siendo un modelo de difusión pesado. El aislamiento de
+  fases evita la degradación extrema causada por el fallback CLI, pero el tiempo
+  final depende de pasos, duración, resolución y GPU.
+- El perfil de 8 pasos prioriza velocidad; revisa el resultado antes de una entrega.
+- La selección multi-referencia elige una imagen por clip, no fusiona varias
+  referencias dentro de una misma pasada.
+- Procesa únicamente material propio o autorizado y conserva el manifiesto de
+  procedencia generado por FaceSwap-Pro.

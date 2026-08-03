@@ -17,6 +17,7 @@ inputs/target_faces/*
 models/*.onnx
 models/*.task
 models/hififace/
+models/dreamidv/
 third_party/
 !models/.gitkeep
 outputs/videos/*

@@ -133,13 +133,16 @@ faceswap-pro doctor --config .\config\quality_3dmm.yaml
 
 El bloque `hififace_3dmm.ready` debe ser `true`.
 
-## Preparar DreamID-V para RTX 5070 Ti
+## Preparar DreamID-V para GPU NVIDIA de 16 GB
 
-DreamID-V se ejecuta en un entorno Python separado para que sus dependencias no
-entren en conflicto con ONNX Runtime e InsightFace. Consulta
-[`docs/dreamidv_5070ti.md`](docs/dreamidv_5070ti.md) para la estructura completa.
-El perfil incluido usa `dreamidv_faster.pth`, 832×480, 49 fotogramas, 16 pasos,
-offloading de modelo y T5 en CPU.
+DreamID-V puede usar el mismo entorno Conda que los demás backends. El instalador
+selectivo evita duplicar OpenCV u ONNX Runtime CPU y aplica el fallback de atención
+de PyTorch cuando FlashAttention no está disponible en Windows. Consulta
+[`docs/dreamidv.md`](docs/dreamidv.md) para la estructura completa.
+
+El perfil `quality_dreamidv.yaml` usa `dreamidv_faster.pth`, 832×480, 49
+fotogramas y 16 pasos. El perfil `speed_dreamidv.yaml` conserva la misma
+resolución pero usa 8 pasos y menos solape para pruebas o vídeos largos.
 
 Valida primero los archivos y la GPU:
 
@@ -153,13 +156,21 @@ Ejecuta:
 faceswap-pro run --config .\config\quality_dreamidv.yaml
 ```
 
-El backend divide vídeos largos en ventanas `4n+1` solapadas, desplaza fronteras a
-cortes de escena y mantiene el runtime cargado mediante un worker persistente. Un
-fallback automático conserva compatibilidad con la CLI oficial. La referencia
-objetivo se usa para seguir a la persona correcta y la salida se recompone sobre el
-vídeo original únicamente dentro de sus máscaras temporales. Si la misma identidad
-aparece directamente y reflejada en un espejo, ambas regiones se incluyen en la
-composición.
+Para una ejecución más rápida:
+
+```powershell
+faceswap-pro run --config .\config\speed_dreamidv.yaml
+```
+
+El backend divide vídeos largos en ventanas `4n+1` solapadas y desplaza fronteras a
+cortes de escena. Primero precalcula DWPose para todos los clips en un proceso
+separado; después cierra ese proceso, libera su VRAM y carga DreamID-V una sola vez.
+InsightFace también libera sus sesiones GPU tras completar el tracking. Si el worker
+de difusión falla, se reinicia de forma controlada en lugar de degradar
+silenciosamente a la CLI lenta. La referencia objetivo se usa para seguir a la
+persona correcta y la salida se recompone únicamente dentro de sus máscaras
+temporales. Si la misma identidad aparece directamente y reflejada en un espejo,
+ambas regiones se incluyen en la composición.
 
 Cada ejecución temporal genera también métricas JSON, una hoja visual entrada/salida,
 hashes cacheados de modelos y C2PA opcional. Consulta

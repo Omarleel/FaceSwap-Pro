@@ -70,7 +70,10 @@ class DreamIDVOptions:
     chunk_pix_fmt: str
     chunk_container: str
     persistent_worker: bool
+    precompute_pose: bool
+    worker_restart_attempts: int
     worker_fallback: bool
+    release_analysis_gpu: bool
     reference_bank_size: int
     target_ambiguity_margin: float
     target_min_coverage: float
@@ -172,7 +175,10 @@ class DreamIDVOptions:
             chunk_pix_fmt=str(options.get("chunk_pix_fmt", "yuv444p")),
             chunk_container=str(options.get("chunk_container", "mkv")).lstrip("."),
             persistent_worker=bool(options.get("persistent_worker", False)),
+            precompute_pose=bool(options.get("precompute_pose", True)),
+            worker_restart_attempts=max(0, int(options.get("worker_restart_attempts", 1))),
             worker_fallback=bool(options.get("worker_fallback", True)),
+            release_analysis_gpu=bool(options.get("release_analysis_gpu", True)),
             reference_bank_size=max(1, int(options.get("reference_bank_size", 6))),
             target_ambiguity_margin=ambiguity_margin,
             target_min_coverage=min_coverage,
@@ -274,6 +280,18 @@ class DreamIDVClip:
         return self.start_frame + self.valid_frames
 
 
+@dataclass(frozen=True)
+class DreamIDVPreparedClip:
+    """Artefactos preparados antes de cargar el modelo Wan en la GPU."""
+
+    clip: DreamIDVClip
+    source_clip: Path
+    generated_clip: Path
+    source_reference: Path
+    pose_video: Path | None = None
+    mask_video: Path | None = None
+
+
 class DreamIDVClipPlanner:
     """Planifica ventanas 4n+1 con solapamiento y cortes de escena."""
 
@@ -284,7 +302,7 @@ class DreamIDVClipPlanner:
         metadata = probe_video(input_video)
         duration = metadata.frame_count / metadata.fps if metadata.frame_count > 0 else 0.0
         if duration <= 0:
-            raise ValueError("No se pudo determinar la duración del vídeo de entrada.")
+            raise ValueError("No se pudo determinar la duraciÃ³n del vÃ­deo de entrada.")
         requested_frames = max(1, int(math.ceil(duration * self.options.sample_fps)))
         return duration, requested_frames
 
@@ -302,7 +320,7 @@ class DreamIDVClipPlanner:
             raise ValueError("requested_frames debe ser positivo.")
         if not self.options.chunking and requested_frames > self.options.frame_num:
             raise ValueError(
-                "El vídeo excede frame_num y chunking está desactivado; "
+                "El vÃ­deo excede frame_num y chunking estÃ¡ desactivado; "
                 "activa chunking para no truncar la salida."
             )
         if requested_frames <= self.options.frame_num or not self.options.chunking:
@@ -365,6 +383,75 @@ class DreamIDVClipPlanner:
         return int((self.options.seed + start) % (2**31 - 1))
 
 
+class DreamIDVPoseClient:
+    """Precalcula DWPose en un proceso que se cierra antes de cargar Wan.
+
+    DWPose y DreamID-V nunca comparten VRAM. El proceso mantiene las sesiones
+    ONNX entre clips para no recargar los modelos, pero se termina por completo
+    al finalizar la fase de preprocesamiento.
+    """
+
+    PREFIX = "FACESWAP_RESULT "
+
+    def __init__(self, options: DreamIDVOptions) -> None:
+        worker = Path(__file__).with_name("dreamidv_pose_worker.py").resolve()
+        command = [
+            options.python_executable,
+            str(worker),
+            "--repository",
+            str(options.repository_path),
+            "--device-id",
+            str(options.device_id),
+        ]
+        self.process = subprocess.Popen(
+            command,
+            cwd=options.repository_path,
+            env=_dreamidv_environment(options),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+
+    def generate(self, *, input_video: Path, pose_video: Path, mask_video: Path) -> None:
+        self._request(
+            {
+                "input_video": str(input_video.resolve()),
+                "pose_video": str(pose_video.resolve()),
+                "mask_video": str(mask_video.resolve()),
+            }
+        )
+
+    def _request(self, payload: Mapping[str, Any]) -> None:
+        if self.process.stdin is None or self.process.stdout is None:
+            raise RuntimeError("El worker DWPose no tiene pipes disponibles.")
+        self.process.stdin.write(json.dumps(dict(payload), ensure_ascii=False) + "\n")
+        self.process.stdin.flush()
+        while True:
+            line = self.process.stdout.readline()
+            if not line:
+                code = self.process.poll()
+                raise RuntimeError(f"El worker DWPose terminó inesperadamente ({code}).")
+            if line.startswith(self.PREFIX):
+                response = json.loads(line[len(self.PREFIX) :])
+                if not response.get("ok"):
+                    raise RuntimeError(str(response.get("error", "Error desconocido de DWPose")))
+                return
+            console.print(f"[dim]{line.rstrip()}[/dim]")
+
+    def close(self) -> None:
+        _close_jsonl_process(self.process)
+
+    def __enter__(self) -> DreamIDVPoseClient:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+
 class DreamIDVPersistentClient:
     """Cliente JSONL que mantiene DreamID-V cargado durante todos los clips."""
 
@@ -414,7 +501,7 @@ class DreamIDVPersistentClient:
             line = self.process.stdout.readline()
             if not line:
                 code = self.process.poll()
-                raise RuntimeError(f"El worker DreamID-V terminó inesperadamente ({code}).")
+                raise RuntimeError(f"El worker DreamID-V terminÃ³ inesperadamente ({code}).")
             if line.startswith(self.PREFIX):
                 response = json.loads(line[len(self.PREFIX) :])
                 if not response.get("ok"):
@@ -423,18 +510,7 @@ class DreamIDVPersistentClient:
             console.print(f"[dim]{line.rstrip()}[/dim]")
 
     def close(self) -> None:
-        if self.process.stdin is not None and self.process.poll() is None:
-            try:
-                self.process.stdin.write(json.dumps({"command": "shutdown"}) + "\n")
-                self.process.stdin.flush()
-            except (BrokenPipeError, OSError):
-                pass
-        if self.process.poll() is None:
-            try:
-                self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.process.terminate()
-                self.process.wait(timeout=10)
+        _close_jsonl_process(self.process)
 
     def __enter__(self) -> DreamIDVPersistentClient:
         return self
@@ -443,19 +519,40 @@ class DreamIDVPersistentClient:
         self.close()
 
 
+def _close_jsonl_process(process: subprocess.Popen[str]) -> None:
+    if process.stdin is not None and process.poll() is None:
+        try:
+            process.stdin.write(json.dumps({"command": "shutdown"}) + "\n")
+            process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+    if process.poll() is None:
+        try:
+            process.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+
+
 def _dreamidv_environment(options: DreamIDVOptions) -> dict[str, str]:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(options.device_id)
-    env.setdefault(
-        "PYTORCH_CUDA_ALLOC_CONF",
-        "expandable_segments:True,max_split_size_mb:128",
-    )
+    # expandable_segments no está soportado por varias builds de PyTorch/Windows.
+    # max_split_size y garbage_collection_threshold reducen fragmentación sin ese aviso.
+    allocator = "max_split_size_mb:128,garbage_collection_threshold:0.80"
+    if os.name != "nt":
+        allocator = "expandable_segments:True," + allocator
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", allocator)
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
     return env
 
 
 class DreamIDVSubprocessBackend:
-    """Backend temporal con ventanas solapadas, tracking y recomposición selectiva."""
+    """Backend temporal con ventanas solapadas, tracking y recomposiciÃ³n selectiva."""
 
     def __init__(
         self,
@@ -488,7 +585,7 @@ class DreamIDVSubprocessBackend:
         color = probe_video_color(request.input_video)
         if color.hdr and self.options.hdr_policy == "reject":
             raise ValueError(
-                "El vídeo es HDR y hdr_policy=reject. Usa tonemap para una conversión explícita."
+                "El vÃ­deo es HDR y hdr_policy=reject. Usa tonemap para una conversiÃ³n explÃ­cita."
             )
 
         with tempfile.TemporaryDirectory(prefix="faceswap_dreamidv_") as temp:
@@ -532,6 +629,17 @@ class DreamIDVSubprocessBackend:
                         f"ratio={track.ambiguous_ratio:.1%}."
                     )
 
+            analysis_gpu_released = False
+            if self.options.release_analysis_gpu and self.analyzer is not None:
+                release = getattr(self.analyzer, "release_gpu_resources", None)
+                if callable(release):
+                    release()
+                    self.analyzer = None
+                    analysis_gpu_released = True
+                    console.print(
+                        "[green]InsightFace liberado de la GPU antes de DWPose/Wan.[/green]"
+                    )
+
             clips = self.planner.plan_frames(
                 requested_frames,
                 track.scene_cuts if track is not None else (),
@@ -540,17 +648,22 @@ class DreamIDVSubprocessBackend:
                 VideoReference(request.source_reference),
             )
             generated: list[tuple[DreamIDVClip, Path, Path]] = []
+            prepared: list[DreamIDVPreparedClip] = []
+            use_persistent_worker = (
+                self.options.persistent_worker
+                and self.options.variant in {"faster", "dwpose"}
+            )
 
-            worker: DreamIDVPersistentClient | None = None
-            worker_failed = False
-            if self.options.persistent_worker and self.options.variant in {"faster", "dwpose"}:
-                try:
-                    worker = DreamIDVPersistentClient(self.options, self.checkpoint)
-                except Exception as exc:  # noqa: BLE001 - fallback explícito
-                    if not self.options.worker_fallback:
-                        raise
-                    worker_failed = True
-                    console.print(f"[yellow]Worker persistente no disponible:[/yellow] {exc}")
+            # Fase 1: extrae todos los clips y calcula DWPose en un proceso
+            # persistente separado. Ese proceso se cierra antes de cargar Wan,
+            # por lo que sus sesiones ONNX liberan toda la VRAM.
+            pose_worker: DreamIDVPoseClient | None = None
+            if use_persistent_worker and self.options.precompute_pose:
+                console.print(
+                    "[cyan]DreamID-V:[/cyan] precalculando pose y máscaras "
+                    f"para {len(clips)} clips antes de cargar Wan."
+                )
+                pose_worker = DreamIDVPoseClient(self.options)
 
             try:
                 for clip in clips:
@@ -565,15 +678,60 @@ class DreamIDVSubprocessBackend:
                         start_frame=clip.start_frame,
                     )
                     reference = self._select_reference(references, track, clip)
+                    pose_video: Path | None = None
+                    mask_video: Path | None = None
+                    if pose_worker is not None:
+                        pose_dir = temp_dir / f"pose_{clip.index:04d}"
+                        pose_video = pose_dir / "pose.mp4"
+                        mask_video = pose_dir / "mask.mp4"
+                        console.print(
+                            f"[cyan]DWPose:[/cyan] clip {clip.index + 1}/{len(clips)}"
+                        )
+                        pose_worker.generate(
+                            input_video=source_clip,
+                            pose_video=pose_video,
+                            mask_video=mask_video,
+                        )
+                    prepared.append(
+                        DreamIDVPreparedClip(
+                            clip=clip,
+                            source_clip=source_clip,
+                            generated_clip=generated_clip,
+                            source_reference=reference.path,
+                            pose_video=pose_video,
+                            mask_video=mask_video,
+                        )
+                    )
+            finally:
+                if pose_worker is not None:
+                    pose_worker.close()
+                    console.print(
+                        "[green]DWPose completado; proceso cerrado y VRAM liberada antes de Wan.[/green]"
+                    )
+
+            worker: DreamIDVPersistentClient | None = None
+            worker_failed = False
+            worker_restarts = 0
+            if use_persistent_worker:
+                if not self.options.precompute_pose:
+                    raise RuntimeError(
+                        "persistent_worker requiere precompute_pose=true para evitar "
+                        "que DWPose y Wan compartan VRAM."
+                    )
+                worker = DreamIDVPersistentClient(self.options, self.checkpoint)
+
+            try:
+                for item in prepared:
+                    clip = item.clip
                     console.print(
                         f"[cyan]DreamID-V:[/cyan] clip {clip.index + 1}/{len(clips)}, "
                         f"inicio={clip.start_frame}, solape={clip.overlap_before}, "
-                        f"ref={reference.path.name}"
+                        f"ref={item.source_reference.name}"
                     )
                     payload = {
-                        "input_video": str(source_clip.resolve()),
-                        "source_reference": str(reference.path.resolve()),
-                        "output_video": str(generated_clip.resolve()),
+                        "input_video": str(item.source_clip.resolve()),
+                        "source_reference": str(item.source_reference.resolve()),
+                        "output_video": str(item.generated_clip.resolve()),
                         "frame_num": self.options.frame_num,
                         "seed": clip.seed,
                         "sample_steps": self.options.sample_steps,
@@ -582,25 +740,51 @@ class DreamIDVSubprocessBackend:
                         "guide_scale": self.options.sample_guide_scale_img,
                         "offload_model": self.options.offload_model,
                     }
-                    if worker is not None:
+                    if item.pose_video is not None and item.mask_video is not None:
+                        payload.update(
+                            {
+                                "pose_video": str(item.pose_video.resolve()),
+                                "mask_video": str(item.mask_video.resolve()),
+                            }
+                        )
+
+                    generated_by_worker = False
+                    clip_restart_attempts = 0
+                    while worker is not None and not generated_by_worker:
                         try:
                             worker.generate(payload)
+                            generated_by_worker = True
                         except Exception as exc:  # noqa: BLE001
                             worker.close()
                             worker = None
+                            if clip_restart_attempts < self.options.worker_restart_attempts:
+                                clip_restart_attempts += 1
+                                worker_restarts += 1
+                                console.print(
+                                    "[yellow]Worker DreamID-V falló; se libera su proceso "
+                                    f"y se reinicia ({clip_restart_attempts}/"
+                                    f"{self.options.worker_restart_attempts} para este clip):"
+                                    f"[/yellow] {exc}"
+                                )
+                                worker = DreamIDVPersistentClient(
+                                    self.options, self.checkpoint
+                                )
+                                continue
                             if not self.options.worker_fallback:
                                 raise
                             worker_failed = True
                             console.print(
-                                f"[yellow]Worker falló; se usa CLI por clip:[/yellow] {exc}"
+                                "[yellow]Worker agotó los reinicios; se usa la CLI "
+                                f"solo para este clip:[/yellow] {exc}"
                             )
-                    if worker is None:
+
+                    if not generated_by_worker:
                         command = build_dreamidv_command(
                             self.options,
                             checkpoint=self.checkpoint,
-                            input_video=source_clip,
-                            source_reference=reference.path,
-                            output_video=generated_clip,
+                            input_video=item.source_clip,
+                            source_reference=item.source_reference,
+                            output_video=item.generated_clip,
                             seed=clip.seed,
                         )
                         self.runner(
@@ -609,12 +793,12 @@ class DreamIDVSubprocessBackend:
                             env=_dreamidv_environment(self.options),
                             check=True,
                         )
-                    if not generated_clip.is_file():
+                    if not item.generated_clip.is_file():
                         raise RuntimeError(
                             "DreamID-V terminó sin crear el vídeo esperado: "
-                            f"{generated_clip}"
+                            f"{item.generated_clip}"
                         )
-                    generated.append((clip, generated_clip, source_clip))
+                    generated.append((clip, item.generated_clip, item.source_clip))
             finally:
                 if worker is not None:
                     worker.close()
@@ -644,7 +828,11 @@ class DreamIDVSubprocessBackend:
                 "offload_model": self.options.offload_model,
                 "t5_cpu": self.options.t5_cpu,
                 "persistent_worker_requested": self.options.persistent_worker,
+                "precompute_pose": self.options.precompute_pose,
+                "worker_restart_attempts": self.options.worker_restart_attempts,
+                "worker_restarts": worker_restarts,
                 "persistent_worker_fallback": worker_failed,
+                "analysis_gpu_released": analysis_gpu_released,
                 "target_track": track.as_dict() if track is not None else None,
                 "quality_metrics": quality,
                 "clip_plan": [
@@ -717,7 +905,7 @@ class DreamIDVSubprocessBackend:
             if not (hdr and self.options.hdr_policy == "tonemap"):
                 raise
             console.print(
-                "[yellow]El FFmpeg no soportó tonemap/zscale; se usa conversión SDR básica.[/yellow]"
+                "[yellow]El FFmpeg no soportÃ³ tonemap/zscale; se usa conversiÃ³n SDR bÃ¡sica.[/yellow]"
             )
             fallback = command.copy()
             filter_index = fallback.index("-vf") + 1
@@ -999,7 +1187,7 @@ class DreamIDVBackendFactory:
         missing = [name for name, okay in readiness["checks"].items() if not okay]
         if missing:
             raise RuntimeError(
-                "DreamID-V no está listo. Elementos faltantes: " + ", ".join(missing)
+                "DreamID-V no estÃ¡ listo. Elementos faltantes: " + ", ".join(missing)
             )
 
         services = create_insightface_analysis_services(config)
@@ -1024,6 +1212,9 @@ class DreamIDVBackendFactory:
                 "chunk_overlap_frames": options.chunk_overlap_frames,
                 "scene_aware_chunking": options.scene_aware_chunking,
                 "persistent_worker": options.persistent_worker,
+                "precompute_pose": options.precompute_pose,
+                "worker_restart_attempts": options.worker_restart_attempts,
+                "release_analysis_gpu": options.release_analysis_gpu,
                 "offload_model": options.offload_model,
                 "t5_cpu": options.t5_cpu,
                 "python_executable": options.python_executable,
@@ -1045,7 +1236,7 @@ class DreamIDVBackendFactory:
             capabilities=ModelCapabilities(
                 generator="dreamid_v_wan_1.3b",
                 native_output_size=720 if options.size == "1280*720" else 480,
-                geometry_conditioning="pose_video_internal",
+                geometry_conditioning="pose_video_precomputed_separate_process",
                 geometry_postprocess="target_track_mask_occlusion_aware",
                 temporal_generation="video_diffusion_transformer_overlap_stitched",
             ),
@@ -1099,6 +1290,15 @@ def dreamidv_readiness(
             if options.persistent_worker and options.variant in {"faster", "dwpose"}
             else True
         ),
+        "pose_precompute_bridge": (
+            Path(__file__).with_name("dreamidv_pose_worker.py").is_file()
+            if (
+                options.persistent_worker
+                and options.precompute_pose
+                and options.variant in {"faster", "dwpose"}
+            )
+            else True
+        ),
     }
     environment: dict[str, Any] | None = None
     if probe_environment and python_ok:
@@ -1124,6 +1324,9 @@ def dreamidv_readiness(
             "chunk_overlap_frames": options.chunk_overlap_frames,
             "scene_aware_chunking": options.scene_aware_chunking,
             "persistent_worker": options.persistent_worker,
+            "precompute_pose": options.precompute_pose,
+            "worker_restart_attempts": options.worker_restart_attempts,
+            "release_analysis_gpu": options.release_analysis_gpu,
         },
         "checks": checks,
         "environment": environment,
@@ -1135,7 +1338,9 @@ def _probe_external_environment(python_executable: str) -> dict[str, Any]:
 import json
 payload = {"ready": False}
 try:
-    import cv2, decord, diffusers, numpy, onnxruntime, torch, torchvision, transformers
+    import torch
+    import torchvision
+    import cv2, decord, diffusers, numpy, onnxruntime, transformers
     payload.update({
         "ready": bool(torch.cuda.is_available()),
         "torch": torch.__version__,
@@ -1166,13 +1371,13 @@ print(json.dumps(payload))
             text=True,
             timeout=30,
         )
-    except Exception as exc:  # noqa: BLE001 - diagnóstico, no inferencia
+    except Exception as exc:  # noqa: BLE001 - diagnÃ³stico, no inferencia
         return {"ready": False, "error": f"{type(exc).__name__}: {exc}"}
     lines = [line for line in completed.stdout.splitlines() if line.strip()]
     if not lines:
         return {
             "ready": False,
-            "error": completed.stderr.strip() or f"Código de salida {completed.returncode}",
+            "error": completed.stderr.strip() or f"CÃ³digo de salida {completed.returncode}",
         }
     try:
         payload = json.loads(lines[-1])
@@ -1182,3 +1387,4 @@ print(json.dumps(payload))
         payload["ready"] = False
         payload.setdefault("error", completed.stderr.strip())
     return payload
+
