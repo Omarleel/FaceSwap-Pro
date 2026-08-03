@@ -159,7 +159,7 @@ class FaceRestorer(Protocol):
 
 @dataclass(frozen=True)
 class ModelBundle:
-    """Servicios y metadatos construidos por un backend concreto."""
+    """Servicios de un backend que procesa cada fotograma de forma independiente."""
 
     backend: str
     analyzer: FaceAnalyzer
@@ -170,11 +170,64 @@ class ModelBundle:
     model_artifacts: tuple[Path, ...] = ()
 
 
+@dataclass(frozen=True)
+class VideoReference:
+    """Referencia alineada con metadatos de pose/calidad para selección por plano."""
+
+    path: Path
+    yaw: float = 0.0
+    pitch: float = 0.0
+    quality: float = 1.0
+
+
+@dataclass(frozen=True)
+class VideoSwapRequest:
+    """Entradas neutrales para un generador que procesa clips completos."""
+
+    input_video: Path
+    source_reference: Path
+    output_video: Path
+    source_references: tuple[VideoReference, ...] = ()
+    target_embedding: np.ndarray | None = field(default=None, repr=False, compare=False)
+    source_embedding: np.ndarray | None = field(default=None, repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class VideoSwapResult:
+    """Resultado de un backend temporal nativo."""
+
+    output_video: Path
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@runtime_checkable
+class VideoSwapBackend(Protocol):
+    """Contrato para modelos de vídeo que no deben ejecutarse frame a frame."""
+
+    def process(self, request: VideoSwapRequest) -> VideoSwapResult: ...
+
+
+@dataclass(frozen=True)
+class VideoModelBundle:
+    """Servicios de un backend temporal nativo, separado del pipeline por fotogramas."""
+
+    backend: str
+    analyzer: FaceAnalyzer
+    processor: VideoSwapBackend
+    providers: tuple[Any, ...] = ()
+    runtime: Mapping[str, Any] = field(default_factory=dict)
+    capabilities: ModelCapabilities = field(default_factory=ModelCapabilities)
+    model_artifacts: tuple[Path, ...] = ()
+
+
+BackendBundle = ModelBundle | VideoModelBundle
+
+
 class ModelBackendFactory(Protocol):
-    def create(self, config: Any, model_path: Path) -> ModelBundle: ...
+    def create(self, config: Any, model_path: Path) -> BackendBundle: ...
 
 
-BackendFactory = ModelBackendFactory | Callable[[Any, Path], ModelBundle]
+BackendFactory = ModelBackendFactory | Callable[[Any, Path], BackendBundle]
 _BACKENDS: dict[str, BackendFactory] = {}
 
 
@@ -198,7 +251,7 @@ def available_model_backends() -> tuple[str, ...]:
     return tuple(sorted(_BACKENDS))
 
 
-def create_model_bundle(name: str, config: Any, model_path: Path) -> ModelBundle:
+def create_model_bundle(name: str, config: Any, model_path: Path) -> BackendBundle:
     key = name.strip().lower()
     try:
         factory = _BACKENDS[key]

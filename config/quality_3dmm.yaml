@@ -20,10 +20,10 @@ engine:
     do_copy_in_default_stream: "1"
     use_tf32: "1"
   options:
-    # --model-path puede sustituir esta ruta. Es un directorio con generator_80000.pth.
+    # --model-path puede sustituir esta ruta. Es un directorio con generator_320000.pth.
     model_path: models/hififace/standard_model
     repository_path: third_party/HiFiFace-pytorch
-    checkpoint_iteration: 80000
+    checkpoint_iteration: 320000
 
     # Modelos auxiliares del extractor de identidad 3DMM.
     f_3d_checkpoint_path: models/hififace/aux/Deep3DFaceRecon/epoch_20_new.pth

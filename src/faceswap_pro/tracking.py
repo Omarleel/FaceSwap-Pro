@@ -76,16 +76,20 @@ class TemporalFaceTracker:
             self.reset(clear_flow=True)
         return gray, cut
 
-    def _mark_missing(self, gray: np.ndarray) -> None:
+    def mark_missing(self, gray: np.ndarray) -> None:
         if self.state is not None:
             self.state.missing += 1
             if self.state.missing > self.max_missing_frames:
                 self.reset(clear_flow=False)
         self.previous_gray = gray
 
+    def _mark_missing(self, gray: np.ndarray) -> None:
+        """Alias privado conservado para extensiones antiguas."""
+        self.mark_missing(gray)
+
     def select_detected(self, frame: np.ndarray, gray: np.ndarray, faces):
         if not faces:
-            self._mark_missing(gray)
+            self.mark_missing(gray)
             return None
 
         scored = []
@@ -99,12 +103,12 @@ class TemporalFaceTracker:
             scored.append((score, identity, face))
 
         if not scored:
-            self._mark_missing(gray)
+            self.mark_missing(gray)
             return None
 
         _, identity, best = max(scored, key=lambda item: item[0])
         if identity < self.min_similarity:
-            self._mark_missing(gray)
+            self.mark_missing(gray)
             return None
 
         best_bbox = np.asarray(best.bbox, dtype=np.float32)
@@ -155,7 +159,7 @@ class TemporalFaceTracker:
     def propagate(self, frame: np.ndarray, gray: np.ndarray):
         """Propaga cinco landmarks con Lucas-Kanade entre detecciones completas."""
         if not self.optical_flow or self.state is None or self.previous_gray is None:
-            self._mark_missing(gray)
+            self.mark_missing(gray)
             return None
 
         previous_points = self.state.kps.astype(np.float32).reshape(-1, 1, 2)
@@ -171,14 +175,14 @@ class TemporalFaceTracker:
             minEigThreshold=1e-4,
         )
         if next_points is None or status is None:
-            self._mark_missing(gray)
+            self.mark_missing(gray)
             return None
 
         valid = status.reshape(-1).astype(bool)
         if errors is not None:
             valid &= errors.reshape(-1) <= self.flow_max_error
         if int(valid.sum()) < 3:
-            self._mark_missing(gray)
+            self.mark_missing(gray)
             return None
 
         old = previous_points.reshape(-1, 2)[valid]
@@ -192,7 +196,7 @@ class TemporalFaceTracker:
             )
         transform = np.asarray(transform, dtype=np.float32)
         if not self._valid_transform(transform, frame.shape):
-            self._mark_missing(gray)
+            self.mark_missing(gray)
             return None
 
         moved_kps = cv2.transform(self.state.kps[None, ...], transform)[0]
@@ -204,7 +208,7 @@ class TemporalFaceTracker:
             or moved_bbox[0] >= w
             or moved_bbox[1] >= h
         ):
-            self._mark_missing(gray)
+            self.mark_missing(gray)
             return None
 
         self.state.bbox = moved_bbox.astype(np.float32)

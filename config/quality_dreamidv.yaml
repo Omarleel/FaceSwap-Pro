@@ -1,0 +1,146 @@
+engine:
+  backend: dreamid_v
+  plugins: []
+  # InsightFace se usa para construir la identidad de origen y seguir al sujeto objetivo.
+  model_pack: buffalo_l
+  det_size: [640, 640]
+  det_thresh: 0.55
+  allowed_modules:
+    - detection
+    - recognition
+  max_faces: 10
+  providers:
+    - CUDAExecutionProvider
+    - CPUExecutionProvider
+  cuda:
+    device_id: 0
+    arena_extend_strategy: kNextPowerOfTwo
+    cudnn_conv_algo_search: EXHAUSTIVE
+    cudnn_conv_use_max_workspace: "1"
+    do_copy_in_default_stream: "1"
+    use_tf32: "1"
+  options:
+    model_path: models/dreamidv/dreamidv_faster.pth
+    repository_path: third_party/DreamID-V
+    wan_checkpoint_dir: models/dreamidv/Wan2.1-T2V-1.3B
+    python_executable: .venv-dreamidv/Scripts/python.exe
+
+    # Perfil equilibrado para RTX 5070 Ti de 16 GB.
+    variant: faster
+    size: "832*480"
+    frame_num: 49
+    sample_fps: 16
+    sample_steps: 16
+    sample_shift: 5.0
+    sample_guide_scale_img: 4.0
+    sample_solver: unipc
+    seed: 42
+    seed_mode: absolute_frame
+    offload_model: true
+    t5_cpu: true
+    device_id: 0
+
+    # Ventanas solapadas y cortes de escena. Los intermedios son sin pérdida.
+    chunking: true
+    chunk_overlap_frames: 17
+    scene_aware_chunking: true
+    scene_cut_window_frames: 12
+    chunk_codec: libx264
+    chunk_crf: 0
+    chunk_pix_fmt: yuv444p
+    chunk_container: mkv
+
+    # Mantiene DreamID-V cargado entre clips; si falla, vuelve a la CLI oficial.
+    persistent_worker: true
+    worker_fallback: true
+
+    # Banco de identidad y selección del sujeto objetivo.
+    reference_bank_size: 6
+    target_ambiguity_margin: 0.05
+    target_min_coverage: 0.05
+    target_max_ambiguous_ratio: 0.15
+
+    # Recomposición selectiva: conserva fondo, ropa, cabello externo y oclusores.
+    mask_expand: 1.08
+    mask_feather_ratio: 0.055
+    mask_temporal_smoothing: 0.62
+    occlusion_strength: 0.92
+    color_match: true
+
+    # Métricas por ejecución y gestión explícita de HDR.
+    benchmark_enabled: true
+    benchmark_interval: 8
+    hdr_policy: tonemap
+
+identity:
+  source_min_score: 0.60
+  target_min_similarity: 0.30
+  max_source_images: 40
+
+tracking:
+  smoothing: 0.45
+  max_missing_frames: 6
+  scene_cut_threshold: 0.42
+  detection_interval: 1
+  full_scan_interval: 30
+  max_recognition_candidates: 4
+  optical_flow: true
+  flow_win_size: 31
+  flow_max_level: 3
+  flow_max_error: 25.0
+
+# Se conservan para compatibilidad con AppConfig; el backend temporal usa su
+# compositor específico y no el compositor de crops del flujo ONNX.
+blend:
+  aligned_size: 512
+  mask_shrink: 1.0
+  mask_blur_ratio: 0.0
+  color_match_strength: 0.0
+  detail_strength: 0.0
+  roi_enabled: false
+  roi_margin: 0.0
+  interpolation: lanczos
+
+restorer:
+  enabled: false
+  model_path: models/face_restorer.onnx
+  input_size: 512
+  output_range: auto
+
+# Esta codificación sí se aplica a la salida temporal antes de recuperar el audio.
+encoding:
+  codec: h264_nvenc
+  preset: p6
+  cq: 16
+  audio_bitrate: 256k
+  fallback_codec: libx264
+  fallback_preset: slow
+  fallback_crf: 16
+  pixel_format: yuv420p
+
+performance:
+  decoder: auto
+  hardware_decode: true
+  reader_queue: 2
+  analysis_queue: 1
+  writer_queue: 2
+  max_inflight: 1
+  postprocess_workers: 1
+  opencv_threads: 0
+
+provenance:
+  visible_disclosure: false
+  write_manifest: true
+  # Los hashes se almacenan en outputs/manifests/.hash-cache y solo se recalculan
+  # cuando cambian el tamaño, mtime o estructura del checkpoint.
+  hash_models: true
+
+  # C2PA es opcional para no bloquear una instalación sin c2patool. Para firma
+  # de producción configura certificado y clave propios y usa c2pa_required: true.
+  c2pa_enabled: true
+  c2pa_required: false
+  c2pa_tool: c2patool
+  c2pa_algorithm: es256
+  # c2pa_sign_cert: certificates/signing-cert.pem
+  # c2pa_private_key: certificates/signing-key.pem
+  # c2pa_timestamp_url: https://tsa.example.com

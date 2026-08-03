@@ -134,4 +134,5 @@ def test_builtin_registry_exposes_precise_and_legacy_names():
     assert "insightface_inswapper" in backends
     assert "insightface_inswapper_mediapipe_mesh" in backends
     assert "hififace_3dmm" in backends
+    assert "dreamid_v" in backends
     assert "mediapipe_3d_hybrid" in backends

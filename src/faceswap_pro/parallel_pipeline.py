@@ -244,6 +244,7 @@ def _postprocess(
     swap_result: SwapResult | None,
     blender,
     restorer,
+    visible_disclosure: bool,
 ) -> ProcessedPacket:
     started = time.perf_counter()
     frame = packet.frame
@@ -258,7 +259,8 @@ def _postprocess(
             opacity=swap_result.opacity,
             mask_mode=swap_result.mask_mode,
         )
-    frame = add_disclosure(frame)
+    if visible_disclosure:
+        frame = add_disclosure(frame)
     return ProcessedPacket(
         index=packet.index,
         frame=np.ascontiguousarray(frame),
@@ -280,6 +282,8 @@ def run_parallel_frames(
     config,
 ) -> tuple[PipelineStats, dict[str, Any]]:
     workers, cv_threads = resolve_parallelism(config.performance, restorer.enabled)
+    provenance = getattr(config, "provenance", None)
+    visible_disclosure = bool(getattr(provenance, "visible_disclosure", True))
     cv2.setUseOptimized(True)
     cv2.setNumThreads(cv_threads)
 
@@ -373,6 +377,7 @@ def run_parallel_frames(
                 swap_result,
                 blender,
                 restorer,
+                visible_disclosure,
             )
             progress.update(1)
 

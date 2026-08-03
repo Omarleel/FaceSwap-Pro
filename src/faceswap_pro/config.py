@@ -71,6 +71,11 @@ class EncodingConfig:
     fallback_codec: str
     fallback_preset: str
     fallback_crf: int
+    pixel_format: str = "yuv420p"
+    color_primaries: str | None = None
+    color_transfer: str | None = None
+    color_space: str | None = None
+    color_range: str | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +91,20 @@ class PerformanceConfig:
 
 
 @dataclass(frozen=True)
+class ProvenanceConfig:
+    visible_disclosure: bool
+    write_manifest: bool
+    hash_models: bool
+    c2pa_enabled: bool = False
+    c2pa_required: bool = False
+    c2pa_tool: str = "c2patool"
+    c2pa_sign_cert: Path | None = None
+    c2pa_private_key: Path | None = None
+    c2pa_algorithm: str = "es256"
+    c2pa_timestamp_url: str | None = None
+
+
+@dataclass(frozen=True)
 class AppConfig:
     engine: EngineConfig
     identity: IdentityConfig
@@ -94,6 +113,7 @@ class AppConfig:
     restorer: RestorerConfig
     encoding: EncodingConfig
     performance: PerformanceConfig
+    provenance: ProvenanceConfig
 
 
 def _positive_int(value: Any, default: int, minimum: int = 1) -> int:
@@ -112,6 +132,7 @@ def load_config(path: Path) -> AppConfig:
     restorer = raw["restorer"]
     encoding = raw["encoding"]
     performance = raw.get("performance", {})
+    provenance = raw.get("provenance", {})
 
     backend = str(engine.get("backend", "insightface_inswapper")).strip().lower()
     if not backend:
@@ -125,6 +146,7 @@ def load_config(path: Path) -> AppConfig:
         "insightface_inswapper_mediapipe_mesh",
         "mediapipe_3d_hybrid",  # alias histórico
         "hififace_3dmm",
+        "dreamid_v",
     }
     if (
         backend in insightface_analysis_backends
@@ -203,5 +225,29 @@ def load_config(path: Path) -> AppConfig:
             max_inflight=_positive_int(performance.get("max_inflight", 6), 6),
             postprocess_workers=max(0, int(performance.get("postprocess_workers", 0))),
             opencv_threads=max(0, int(performance.get("opencv_threads", 0))),
+        ),
+        provenance=ProvenanceConfig(
+            visible_disclosure=bool(provenance.get("visible_disclosure", True)),
+            write_manifest=bool(provenance.get("write_manifest", True)),
+            hash_models=bool(provenance.get("hash_models", True)),
+            c2pa_enabled=bool(provenance.get("c2pa_enabled", False)),
+            c2pa_required=bool(provenance.get("c2pa_required", False)),
+            c2pa_tool=str(provenance.get("c2pa_tool", "c2patool")),
+            c2pa_sign_cert=(
+                Path(provenance["c2pa_sign_cert"])
+                if provenance.get("c2pa_sign_cert")
+                else None
+            ),
+            c2pa_private_key=(
+                Path(provenance["c2pa_private_key"])
+                if provenance.get("c2pa_private_key")
+                else None
+            ),
+            c2pa_algorithm=str(provenance.get("c2pa_algorithm", "es256")),
+            c2pa_timestamp_url=(
+                str(provenance["c2pa_timestamp_url"])
+                if provenance.get("c2pa_timestamp_url")
+                else None
+            ),
         ),
     )

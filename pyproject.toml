@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "FaceSwap-Pro"
-version = "0.3.0"
-description = "Pipeline facial modular con INSwapper compatible, postproceso por malla y generación HifiFace condicionada por 3DMM."
+version = "0.5.0"
+description = "Pipeline facial modular con backends por fotograma y DreamID-V temporal sobre Wan 2.1."
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
 dependencies = [

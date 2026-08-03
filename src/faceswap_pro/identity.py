@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -11,6 +12,18 @@ from .modeling import FaceAnalyzer, FaceData
 
 console = Console()
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+
+@dataclass(frozen=True)
+class SourceReferenceSample:
+    path: Path
+    image: np.ndarray
+    face: FaceData
+    embedding: np.ndarray
+    weight: float
+    quality: float
+    yaw: float
+    pitch: float
 
 
 def list_source_images(directory: Path, limit: int) -> list[Path]:
@@ -41,28 +54,64 @@ def _best_face(faces: list[FaceData], image_shape) -> FaceData:
     return max(faces, key=score)
 
 
+def estimate_pose_from_five_points(kps: np.ndarray) -> tuple[float, float]:
+    """Estimación estable y ligera de yaw/pitch para elegir referencias.
+
+    No sustituye un estimador 3D; solo ordena vistas izquierda/frontal/derecha.
+    """
+
+    points = np.asarray(kps, dtype=np.float32)
+    if points.shape[0] < 5:
+        return 0.0, 0.0
+    left_eye, right_eye, nose, left_mouth, right_mouth = points[:5]
+    eye_mid = (left_eye + right_eye) * 0.5
+    mouth_mid = (left_mouth + right_mouth) * 0.5
+    eye_distance = max(1.0, float(np.linalg.norm(right_eye - left_eye)))
+    face_height = max(1.0, float(np.linalg.norm(mouth_mid - eye_mid)))
+    yaw = float(np.clip((nose[0] - eye_mid[0]) / eye_distance * 55.0, -60.0, 60.0))
+    expected_nose_y = eye_mid[1] + 0.52 * face_height
+    pitch = float(np.clip((nose[1] - expected_nose_y) / face_height * 55.0, -40.0, 40.0))
+    return yaw, pitch
+
+
 def _pose_weight(face: FaceData) -> float:
-    pose = face.pose
-    if pose is None or len(pose) < 2:
-        return 1.0
-    pitch, yaw = float(pose[0]), float(pose[1])
+    if face.pose is not None and len(face.pose) >= 2:
+        pitch, yaw = float(face.pose[0]), float(face.pose[1])
+    else:
+        yaw, pitch = estimate_pose_from_five_points(face.kps)
     return max(0.20, float(np.exp(-(abs(pitch) + abs(yaw)) / 70.0)))
 
 
-def build_source_identity(
+def _image_quality(image: np.ndarray, face: FaceData) -> float:
+    h, w = image.shape[:2]
+    x1, y1, x2, y2 = np.asarray(face.bbox, dtype=np.float32)
+    margin_x = 0.08 * max(1.0, x2 - x1)
+    margin_y = 0.08 * max(1.0, y2 - y1)
+    ix1 = max(0, int(np.floor(x1 - margin_x)))
+    iy1 = max(0, int(np.floor(y1 - margin_y)))
+    ix2 = min(w, int(np.ceil(x2 + margin_x)))
+    iy2 = min(h, int(np.ceil(y2 + margin_y)))
+    crop = image[iy1:iy2, ix1:ix2]
+    if crop.size == 0:
+        return 0.0
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    sharpness = float(cv2.Laplacian(gray, cv2.CV_32F).var())
+    sharpness_score = float(np.clip(np.log1p(sharpness) / np.log(1001.0), 0.0, 1.0))
+    mean = float(gray.mean())
+    exposure_score = float(np.exp(-((mean - 128.0) / 95.0) ** 2))
+    clipped = float(np.mean((gray <= 5) | (gray >= 250)))
+    clipping_score = 1.0 - min(1.0, clipped * 4.0)
+    return float(np.clip(0.55 * sharpness_score + 0.30 * exposure_score + 0.15 * clipping_score, 0.0, 1.0))
+
+
+def collect_source_references(
     analyzer: FaceAnalyzer,
     source_dir: Path,
     min_score: float,
     limit: int,
-) -> tuple[FaceData, list[Path]]:
-    paths = list_source_images(source_dir, limit)
-    selected_faces: list[FaceData] = []
-    selected_images: list[np.ndarray] = []
-    embeddings: list[np.ndarray] = []
-    weights: list[float] = []
-    valid_paths: list[Path] = []
-
-    for path in paths:
+) -> list[SourceReferenceSample]:
+    samples: list[SourceReferenceSample] = []
+    for path in list_source_images(source_dir, limit):
         image = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if image is None:
             console.print(f"[yellow]Omitida (no se pudo leer):[/yellow] {path}")
@@ -81,35 +130,98 @@ def build_source_identity(
             continue
         embedding = l2_normalize(face.embedding)
         area_ratio = bbox_area(face.bbox) / max(1.0, image.shape[0] * image.shape[1])
+        quality = _image_quality(image, face)
         weight = max(
             1e-4,
-            float(face.det_score) * np.sqrt(area_ratio) * _pose_weight(face),
+            float(face.det_score)
+            * np.sqrt(area_ratio)
+            * _pose_weight(face)
+            * (0.45 + 0.55 * quality),
         )
-        selected_faces.append(face)
-        selected_images.append(np.ascontiguousarray(image))
-        embeddings.append(embedding)
-        weights.append(weight)
-        valid_paths.append(path)
-        console.print(f"[green]✓[/green] {path.name}  peso={weight:.3f}")
-
-    if not embeddings:
+        if face.pose is not None and len(face.pose) >= 2:
+            pitch, yaw = float(face.pose[0]), float(face.pose[1])
+        else:
+            yaw, pitch = estimate_pose_from_five_points(face.kps)
+        samples.append(
+            SourceReferenceSample(
+                path=path,
+                image=np.ascontiguousarray(image),
+                face=face,
+                embedding=embedding,
+                weight=weight,
+                quality=quality,
+                yaw=yaw,
+                pitch=pitch,
+            )
+        )
+        console.print(
+            f"[green]✓[/green] {path.name}  peso={weight:.3f} "
+            f"calidad={quality:.2f} pose=({yaw:+.1f},{pitch:+.1f})"
+        )
+    if not samples:
         raise ValueError("Ninguna foto de origen produjo un rostro utilizable.")
+    return samples
 
-    matrix = np.stack(embeddings, axis=0)
-    mean_embedding = l2_normalize(
-        np.average(
-            matrix,
-            axis=0,
-            weights=np.asarray(weights, dtype=np.float32),
-        )
-    )
 
-    best_index = int(np.argmax(weights))
-    source_face = selected_faces[best_index].clone()
+def _identity_from_samples(samples: list[SourceReferenceSample]) -> FaceData:
+    matrix = np.stack([sample.embedding for sample in samples], axis=0)
+    weights = np.asarray([sample.weight for sample in samples], dtype=np.float32)
+    mean_embedding = l2_normalize(np.average(matrix, axis=0, weights=weights))
+    best = max(samples, key=lambda sample: sample.weight)
+    source_face = best.face.clone()
     source_face.embedding = mean_embedding.astype(np.float32)
-    source_face.reference_image = selected_images[best_index].copy()
+    source_face.reference_image = best.image.copy()
+    return source_face
 
-    return source_face, valid_paths
+
+def select_diverse_source_references(
+    samples: list[SourceReferenceSample],
+    limit: int = 6,
+) -> list[SourceReferenceSample]:
+    """Selecciona frontal y vistas laterales antes de completar por calidad."""
+
+    if limit <= 0:
+        return []
+    ordered = sorted(samples, key=lambda sample: (sample.quality, sample.weight), reverse=True)
+    bins = [(-90.0, -18.0), (-18.0, 18.0), (18.0, 90.0)]
+    selected: list[SourceReferenceSample] = []
+    for low, high in bins:
+        candidates = [sample for sample in ordered if low <= sample.yaw < high]
+        if candidates:
+            selected.append(candidates[0])
+    selected_paths = {sample.path for sample in selected}
+    for sample in ordered:
+        if sample.path not in selected_paths:
+            selected.append(sample)
+            selected_paths.add(sample.path)
+        if len(selected) >= limit:
+            break
+    return selected[:limit]
+
+
+def build_source_identity(
+    analyzer: FaceAnalyzer,
+    source_dir: Path,
+    min_score: float,
+    limit: int,
+) -> tuple[FaceData, list[Path]]:
+    samples = collect_source_references(analyzer, source_dir, min_score, limit)
+    return _identity_from_samples(samples), [sample.path for sample in samples]
+
+
+def build_source_identity_and_bank(
+    analyzer: FaceAnalyzer,
+    source_dir: Path,
+    min_score: float,
+    limit: int,
+    bank_size: int = 6,
+) -> tuple[FaceData, list[SourceReferenceSample], list[Path]]:
+    samples = collect_source_references(analyzer, source_dir, min_score, limit)
+    return (
+        _identity_from_samples(samples),
+        select_diverse_source_references(samples, bank_size),
+        [sample.path for sample in samples],
+    )
 
 
 def load_reference_embedding(

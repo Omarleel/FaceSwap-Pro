@@ -1,9 +1,10 @@
 # FaceSwap-Pro
 
-Pipeline local y modular de reemplazo facial con GPU NVIDIA. Mantiene el flujo
-INSwapper existente y añade un generador **condicionado internamente por 3DMM**.
-Cada salida conserva la etiqueta visible `CONTENIDO SINTÉTICO · IA` y un manifiesto
-con hashes de entradas y modelos.
+Pipeline local y modular de reemplazo facial con GPU NVIDIA. Mantiene los flujos
+por fotograma existentes y añade un backend temporal nativo para **DreamID-V sobre
+Wan 2.1 1.3B**. La etiqueta visible es configurable por perfil; el perfil DreamID-V
+para RTX 5070 Ti no dibuja marcas sobre los fotogramas y conserva un manifiesto JSON
+separado.
 
 ## Backends incluidos
 
@@ -12,6 +13,7 @@ con hashes de entradas y modelos.
 | `insightface_inswapper` | INSwapper 128 | Ninguna dentro del generador | Compatible y rápido |
 | `insightface_inswapper_mediapipe_mesh` | INSwapper 128 | Postproceso por malla MediaPipe | Compatible, no 3D-aware generativo |
 | `hififace_3dmm` | HifiFace 256 | Identidad condicionada por 3DMM dentro del generador | 3DMM-aware real |
+| `dreamid_v` | DreamID-V + Wan 2.1 1.3B | Diffusion Transformer temporal sobre clips | Backend de vídeo, 480p/720p |
 
 El alias histórico `mediapipe_3d_hybrid` permanece para no romper YAML antiguos,
 pero emite una advertencia de obsolescencia. El nombre era impreciso porque MediaPipe
@@ -33,6 +35,16 @@ FaceGenerator / FaceSwapper┘
                                       │
                                       ▼
                               NVENC + manifiesto
+
+VideoSwapBackend
+        └─ DreamID-V Faster + Wan 2.1 1.3B
+                    │
+                    ├─ banco de referencias por pose/calidad
+                    ├─ tracking real del sujeto objetivo
+                    ├─ ventanas solapadas + worker persistente
+                    ├─ stitching guiado por flujo
+                    ├─ composición selectiva con oclusiones
+                    └─ codificación final + métricas + C2PA/manifiesto
 ```
 
 Las capacidades del modelo se declaran mediante `ModelCapabilities`:
@@ -89,7 +101,7 @@ git -C .\third_party\HiFiFace-pytorch checkout --force
 ```text
 models/hififace/
 ├── standard_model/
-│   └── generator_80000.pth
+│   └── generator_320000.pth
 └── aux/
     ├── Deep3DFaceRecon/epoch_20_new.pth
     ├── arcface/ms1mv3_arcface_r100_fp16_backbone.pth
@@ -116,6 +128,36 @@ faceswap-pro doctor --config .\config\quality_3dmm.yaml
 ```
 
 El bloque `hififace_3dmm.ready` debe ser `true`.
+
+## Preparar DreamID-V para RTX 5070 Ti
+
+DreamID-V se ejecuta en un entorno Python separado para que sus dependencias no
+entren en conflicto con ONNX Runtime e InsightFace. Consulta
+[`docs/dreamidv_5070ti.md`](docs/dreamidv_5070ti.md) para la estructura completa.
+El perfil incluido usa `dreamidv_faster.pth`, 832×480, 49 fotogramas, 16 pasos,
+offloading de modelo y T5 en CPU.
+
+Valida primero los archivos y la GPU:
+
+```powershell
+faceswap-pro doctor --config .\config\quality_dreamidv.yaml
+```
+
+Ejecuta:
+
+```powershell
+faceswap-pro run --config .\config\quality_dreamidv.yaml
+```
+
+El backend divide vídeos largos en ventanas `4n+1` solapadas, desplaza fronteras a
+cortes de escena y mantiene el runtime cargado mediante un worker persistente. Un
+fallback automático conserva compatibilidad con la CLI oficial. La referencia
+objetivo se usa para seguir a la persona correcta y la salida se recompone sobre el
+vídeo original únicamente dentro de su máscara temporal.
+
+Cada ejecución temporal genera también métricas JSON, una hoja visual entrada/salida,
+hashes cacheados de modelos y C2PA opcional. Consulta
+[`docs/mejoras_calidad_2026.md`](docs/mejoras_calidad_2026.md) para el mapa completo.
 
 ## Ejecutar
 
@@ -174,11 +216,13 @@ la consistencia temporal neuronal queda como una extensión separada futura.
 pytest -q
 ```
 
-La suite cubre contratos, configuración, máscara aprendida, compatibilidad del flujo
-anterior, alineación HifiFace y el adaptador 3DMM mediante un runtime simulado.
+La suite cubre contratos, configuración, tracking, ventanas DreamID-V solapadas,
+banco multi-referencia, composición selectiva, métricas visuales, caché de hashes,
+C2PA, compatibilidad del flujo anterior, HifiFace y el adaptador 3DMM.
 
 ## Uso responsable
 
-Procesa únicamente material autorizado. Mantén la etiqueta visible y el manifiesto.
-Revisa por separado las licencias del código, los pesos, BFM, InsightFace y los datos
-con los que se entrenó cada modelo.
+Procesa únicamente material propio o autorizado. El perfil DreamID-V no añade una
+marca visible, pero mantiene un manifiesto JSON, intenta incrustar C2PA y conserva
+los frames originales cuando el sujeto es ambiguo o no está localizado. Revisa por
+separado las licencias del código, los pesos, Wan 2.1, BFM e InsightFace.

@@ -4,6 +4,7 @@ from importlib import import_module
 from pathlib import Path
 
 from .modeling import (
+    BackendBundle,
     ModelBundle,
     available_model_backends,
     create_model_bundle,
@@ -66,6 +67,8 @@ def register_builtin_model_backends() -> None:
     global _BUILTINS_REGISTERED
     if _BUILTINS_REGISTERED:
         return
+    from .dreamidv_backend import BACKEND_NAME as DREAMIDV_BACKEND_NAME
+    from .dreamidv_backend import DreamIDVBackendFactory
     from .hififace_backend import BACKEND_NAME as HIFIFACE_BACKEND_NAME
     from .hififace_backend import HifiFace3DMMBackendFactory
     from .insightface_backend import BACKEND_NAME as INSWAPPER_BACKEND_NAME
@@ -81,6 +84,7 @@ def register_builtin_model_backends() -> None:
     register_model_backend(MESH_BACKEND_NAME, MediaPipeMeshAssistedBackendFactory())
     register_model_backend(LEGACY_BACKEND_NAME, LegacyMediaPipe3DHybridBackendFactory())
     register_model_backend(HIFIFACE_BACKEND_NAME, HifiFace3DMMBackendFactory())
+    register_model_backend(DREAMIDV_BACKEND_NAME, DreamIDVBackendFactory())
     _BUILTINS_REGISTERED = True
 
 
@@ -99,7 +103,7 @@ def load_configured_model_plugins(config) -> None:
             ) from exc
 
 
-def initialize_models(config, model_path: Path) -> ModelBundle:
+def initialize_models(config, model_path: Path) -> BackendBundle:
     """Punto de composición: selecciona el backend configurado y crea sus servicios."""
 
     register_builtin_model_backends()

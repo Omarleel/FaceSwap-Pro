@@ -30,3 +30,19 @@ def test_quality_3d_profile_is_true_3dmm_backend():
     assert config.engine.options["repository_path"] == "third_party/HiFiFace-pytorch"
     assert config.engine.options["checkpoint_iteration"] == 80000
     assert config.tracking.detection_interval == 1
+
+
+def test_dreamidv_profile_disables_visible_disclosure():
+    from pathlib import Path
+
+    config = load_config(Path("config/quality_dreamidv.yaml"))
+
+    assert config.engine.backend == "dreamid_v"
+    assert config.provenance.visible_disclosure is False
+    assert config.provenance.hash_models is True
+    assert config.provenance.c2pa_enabled is True
+    assert config.provenance.c2pa_required is False
+    assert config.engine.options["chunk_overlap_frames"] == 17
+    assert config.engine.options["persistent_worker"] is True
+    assert config.engine.options["reference_bank_size"] == 6
+    assert config.engine.options["frame_num"] % 4 == 1

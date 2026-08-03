@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import platform
+import shutil
 from pathlib import Path
 
 import typer
@@ -286,9 +287,34 @@ def doctor(
         configured_backend = selected_config.engine.backend
         report["configured_backend"] = configured_backend
         report["configured_model"] = str(configured_model)
+        c2pa_tool = str(getattr(selected_config.provenance, "c2pa_tool", "c2patool"))
+        c2pa_candidate = Path(c2pa_tool).expanduser()
+        c2pa_resolved = (
+            str(c2pa_candidate.resolve()) if c2pa_candidate.is_file() else shutil.which(c2pa_tool)
+        )
+        report["c2pa"] = {
+            "enabled": bool(getattr(selected_config.provenance, "c2pa_enabled", False)),
+            "required": bool(getattr(selected_config.provenance, "c2pa_required", False)),
+            "tool": c2pa_resolved,
+            "ready": bool(c2pa_resolved),
+            "production_credentials": bool(
+                getattr(selected_config.provenance, "c2pa_sign_cert", None)
+                and getattr(selected_config.provenance, "c2pa_private_key", None)
+            ),
+        }
         if configured_backend == "hififace_3dmm":
             readiness = _hififace_readiness(selected_config, configured_model)
             report["hififace_3dmm"] = readiness
+            configured_backend_ready = bool(readiness["ready"])
+        elif configured_backend == "dreamid_v":
+            from .dreamidv_backend import dreamidv_readiness
+
+            readiness = dreamidv_readiness(
+                selected_config,
+                configured_model,
+                probe_environment=True,
+            )
+            report["dreamid_v"] = readiness
             configured_backend_ready = bool(readiness["ready"])
         elif configured_backend in {
             "insightface_inswapper_mediapipe_mesh",
@@ -300,6 +326,8 @@ def doctor(
             )
         else:
             configured_backend_ready = configured_model.is_file()
+        if bool(getattr(selected_config.provenance, "c2pa_required", False)):
+            configured_backend_ready = configured_backend_ready and bool(report["c2pa"]["ready"])
         report["configured_backend_ready"] = configured_backend_ready
     console.print(Panel.fit(json.dumps(report, indent=2, ensure_ascii=False), title="Diagnóstico"))
     if not report["cuda_provider_ok"]:

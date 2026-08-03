@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +19,64 @@ class VideoMetadata:
     width: int
     height: int
     frame_count: int
+
+
+@dataclass(frozen=True)
+class VideoColorMetadata:
+    pixel_format: str | None = None
+    color_primaries: str | None = None
+    color_transfer: str | None = None
+    color_space: str | None = None
+    color_range: str | None = None
+    hdr: bool = False
+
+
+def _select_ffprobe() -> Path | None:
+    ffmpeg = select_ffmpeg()
+    if ffmpeg is not None:
+        sibling = ffmpeg.with_name("ffprobe.exe" if ffmpeg.suffix.lower() == ".exe" else "ffprobe")
+        if sibling.is_file():
+            return sibling
+    resolved = shutil.which("ffprobe")
+    return Path(resolved) if resolved else None
+
+
+def probe_video_color(path: Path) -> VideoColorMetadata:
+    ffprobe = _select_ffprobe()
+    if ffprobe is None:
+        return VideoColorMetadata()
+    try:
+        completed = subprocess.run(
+            [
+                str(ffprobe),
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=pix_fmt,color_primaries,color_transfer,color_space,color_range",
+                "-of",
+                "json",
+                str(path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        payload = json.loads(completed.stdout or "{}")
+        stream = (payload.get("streams") or [{}])[0]
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, IndexError):
+        return VideoColorMetadata()
+    transfer = stream.get("color_transfer")
+    return VideoColorMetadata(
+        pixel_format=stream.get("pix_fmt"),
+        color_primaries=stream.get("color_primaries"),
+        color_transfer=transfer,
+        color_space=stream.get("color_space"),
+        color_range=stream.get("color_range"),
+        hdr=transfer in {"smpte2084", "arib-std-b67"},
+    )
 
 
 class VideoReader(Protocol):
@@ -178,6 +238,36 @@ def open_video_reader(path: Path, performance) -> VideoReader:
     return OpenCVVideoReader(path, metadata)
 
 
+
+
+def _codec_color_parameters(codec: str, encoding) -> list[str]:
+    """Inserta VUI de color cuando el códec no conserva todos los flags genéricos."""
+
+    normalized = str(codec).lower()
+    option = None
+    if normalized in {"libx264", "libx264rgb"}:
+        option = "-x264-params"
+    elif normalized == "libx265":
+        option = "-x265-params"
+    if option is None:
+        return []
+    values: list[str] = []
+    primaries = getattr(encoding, "color_primaries", None)
+    transfer = getattr(encoding, "color_transfer", None)
+    matrix = getattr(encoding, "color_space", None)
+    color_range = getattr(encoding, "color_range", None)
+    if primaries:
+        values.append(f"colorprim={primaries}")
+    if transfer:
+        values.append(f"transfer={transfer}")
+    if matrix:
+        values.append(f"colormatrix={matrix}")
+    if color_range:
+        range_value = {"tv": "limited", "pc": "full"}.get(str(color_range), str(color_range))
+        values.append(f"range={range_value}")
+    return [option, ":".join(values)] if values else []
+
+
 class RawFFmpegWriter:
     def __init__(self, output: Path, width: int, height: int, fps: float, encoding) -> None:
         self.ffmpeg = select_ffmpeg(encoding.codec)
@@ -223,9 +313,9 @@ class RawFFmpegWriter:
                 "-crf",
                 str(self.encoding.fallback_crf),
                 "-pix_fmt",
-                "yuv420p",
+                str(getattr(self.encoding, "pixel_format", "yuv420p")),
             ]
-        else:
+        elif str(self.encoding.codec).lower().endswith("_nvenc"):
             video = [
                 "-c:v",
                 self.encoding.codec,
@@ -240,9 +330,33 @@ class RawFFmpegWriter:
                 "-b:v",
                 "0",
                 "-pix_fmt",
-                "yuv420p",
+                str(getattr(self.encoding, "pixel_format", "yuv420p")),
             ]
-        return common + video + [str(self.output)]
+        else:
+            video = [
+                "-c:v",
+                self.encoding.codec,
+                "-preset",
+                self.encoding.preset,
+                "-crf",
+                str(getattr(self.encoding, "cq", 16)),
+                "-pix_fmt",
+                str(getattr(self.encoding, "pixel_format", "yuv420p")),
+            ]
+        selected_codec = (
+            self.encoding.fallback_codec if use_fallback else self.encoding.codec
+        )
+        color_flags = _codec_color_parameters(selected_codec, self.encoding)
+        for flag, attribute in (
+            ("-color_primaries", "color_primaries"),
+            ("-color_trc", "color_transfer"),
+            ("-colorspace", "color_space"),
+            ("-color_range", "color_range"),
+        ):
+            value = getattr(self.encoding, attribute, None)
+            if value:
+                color_flags.extend([flag, str(value)])
+        return common + video + color_flags + [str(self.output)]
 
     def _start(self, use_fallback: bool):
         return subprocess.Popen(self._command(use_fallback), stdin=subprocess.PIPE)
