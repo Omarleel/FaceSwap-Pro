@@ -88,6 +88,9 @@ class TargetTrack:
             "ambiguous_ratio": self.ambiguous_ratio,
             "average_target_faces": float(np.mean(instance_counts)) if instance_counts else 0.0,
             "max_target_faces": max(instance_counts, default=0),
+            "frames_with_multiple_target_faces": sum(
+                1 for count in instance_counts if count > 1
+            ),
         }
 
 

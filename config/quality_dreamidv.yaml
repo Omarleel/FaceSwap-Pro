@@ -44,6 +44,10 @@ engine:
     offload_vae_during_dit: true
     vae_dtype: bfloat16
     stream_video_write: true
+    # Optimizaciones algebraicamente equivalentes: reutilizan invariantes y evitan copias.
+    optimize_model_invariants: true
+    optimize_scheduler_tensors: true
+    sdpa_zero_copy_qkv: true
     t5_cpu: true
     device_id: 0
 
@@ -63,6 +67,10 @@ engine:
     precompute_pose: true
     # Ejecuta DWPose una sola vez sobre el proxy y recorta pose/máscara por clip.
     precompute_pose_global: true
+    # Reutiliza pose/máscara para el mismo vídeo y prepara clips mientras trabaja la GPU.
+    pose_cache_enabled: true
+    pose_cache_max_entries: 8
+    clip_prefetch: 2
     worker_restart_attempts: 1
     worker_fallback: false
     release_analysis_gpu: true
@@ -94,6 +102,13 @@ engine:
     target_ambiguity_margin: 0.05
     target_min_coverage: 0.05
     target_max_ambiguous_ratio: 0.15
+
+    # Máscara de condicionamiento por identidad. DWPose upstream conserva solo
+    # el rostro de mayor área; esta capa mantiene esa máscara cuando coincide con
+    # el actor y añade las apariciones rastreadas que falten, incluidos espejos.
+    target_aware_mask: true
+    target_mask_expand: 1.08
+    target_mask_min_raw_coverage: 0.18
 
     # Recomposición selectiva: conserva fondo, ropa, cabello externo y oclusores.
     mask_expand: 1.08

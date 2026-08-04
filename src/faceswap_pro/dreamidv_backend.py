@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
+import queue
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -17,6 +20,7 @@ import cv2
 import numpy as np
 from rich.console import Console
 
+from .dreamidv_masking import build_target_aware_mask_video
 from .insightface_backend import create_insightface_analysis_services
 from .modeling import (
     ModelCapabilities,
@@ -94,6 +98,15 @@ class DreamIDVOptions:
     offload_vae_during_dit: bool
     vae_dtype: str
     stream_video_write: bool
+    optimize_model_invariants: bool
+    optimize_scheduler_tensors: bool
+    sdpa_zero_copy_qkv: bool
+    clip_prefetch: int
+    pose_cache_enabled: bool
+    pose_cache_max_entries: int
+    target_aware_mask: bool
+    target_mask_expand: float
+    target_mask_min_raw_coverage: float
     sdpa_backend_priority: tuple[str, ...]
     sdpa_allow_math_fallback: bool
     sdpa_padding_mode: str
@@ -246,6 +259,21 @@ class DreamIDVOptions:
             ),
             vae_dtype=vae_dtype,
             stream_video_write=bool(options.get("stream_video_write", True)),
+            optimize_model_invariants=bool(
+                options.get("optimize_model_invariants", variant == "faster")
+            ),
+            optimize_scheduler_tensors=bool(
+                options.get("optimize_scheduler_tensors", variant == "faster")
+            ),
+            sdpa_zero_copy_qkv=bool(options.get("sdpa_zero_copy_qkv", True)),
+            clip_prefetch=max(0, int(options.get("clip_prefetch", 2))),
+            pose_cache_enabled=bool(options.get("pose_cache_enabled", True)),
+            pose_cache_max_entries=max(1, int(options.get("pose_cache_max_entries", 8))),
+            target_aware_mask=bool(options.get("target_aware_mask", True)),
+            target_mask_expand=float(options.get("target_mask_expand", 1.08)),
+            target_mask_min_raw_coverage=float(
+                options.get("target_mask_min_raw_coverage", 0.18)
+            ),
             sdpa_backend_priority=_parse_sdpa_priority(
                 options.get("sdpa_backend_priority", ["cudnn", "flash", "efficient", "math"])
             ),
@@ -642,6 +670,10 @@ class DreamIDVPersistentClient:
             command.append("--offload-vae-during-dit")
         if options.stream_video_write:
             command.append("--stream-video-write")
+        if options.optimize_model_invariants:
+            command.append("--optimize-model-invariants")
+        if options.optimize_scheduler_tensors:
+            command.append("--optimize-scheduler-tensors")
         with profile_span(
             "dreamidv.worker.spawn",
             variant=options.variant,
@@ -769,6 +801,9 @@ def _dreamidv_environment(options: DreamIDVOptions) -> dict[str, str]:
     )
     env["FACESWAP_SDPA_PADDING_MODE"] = options.sdpa_padding_mode
     env["FACESWAP_SDPA_DIAGNOSTICS"] = "1" if options.sdpa_diagnostics else "0"
+    env["FACESWAP_SDPA_ZERO_COPY_QKV"] = (
+        "1" if options.sdpa_zero_copy_qkv else "0"
+    )
     return env
 
 
@@ -903,24 +938,37 @@ class DreamIDVSubprocessBackend:
             )
 
             # Fase 1: DWPose se ejecuta una sola vez sobre el proxy completo.
-            # Después se recortan pose y máscara con los mismos índices de cada
-            # clip, evitando recalcular los fotogramas incluidos en solapes.
+            # La salida puede reutilizarse entre ejecuciones idénticas. Cuando
+            # existe pose global, la extracción de ventanas se solapa con Wan.
             pose_worker: DreamIDVPoseClient | None = None
+            global_pose: Path | None = None
+            global_mask: Path | None = None
             if use_persistent_worker and self.options.precompute_pose:
                 mode = "global" if self.options.precompute_pose_global else "por clip"
                 console.print(
                     "[cyan]DreamID-V:[/cyan] precalculando pose y máscaras "
                     f"({mode}) antes de cargar Wan."
                 )
-                pose_worker = DreamIDVPoseClient(self.options)
+                if self.options.precompute_pose_global:
+                    cached_pose = self._load_cached_global_pose(
+                        request, requested_frames=requested_frames
+                    )
+                    if cached_pose is not None:
+                        global_pose, global_mask = cached_pose
+                        console.print(
+                            "[green]DWPose:[/green] pose global reutilizada desde caché."
+                        )
+                    else:
+                        pose_worker = DreamIDVPoseClient(self.options)
+                else:
+                    pose_worker = DreamIDVPoseClient(self.options)
 
             try:
-                global_pose: Path | None = None
-                global_mask: Path | None = None
                 if pose_worker is not None and self.options.precompute_pose_global:
                     global_pose_dir = temp_dir / "pose_global"
-                    global_pose = global_pose_dir / "pose.mp4"
-                    global_mask = global_pose_dir / "mask.mp4"
+                    global_pose_dir.mkdir(parents=True, exist_ok=True)
+                    generated_pose = global_pose_dir / "pose.mp4"
+                    generated_mask = global_pose_dir / "mask.mp4"
                     with profile_span(
                         "dreamidv.dwpose.global",
                         requested_frames=requested_frames,
@@ -928,79 +976,70 @@ class DreamIDVSubprocessBackend:
                     ):
                         pose_worker.generate(
                             input_video=proxy,
-                            pose_video=global_pose,
-                            mask_video=global_mask,
+                            pose_video=generated_pose,
+                            mask_video=generated_mask,
+                        )
+                    global_pose, global_mask = self._store_cached_global_pose(
+                        request,
+                        requested_frames=requested_frames,
+                        pose_source=generated_pose,
+                        mask_source=generated_mask,
+                    )
+
+                if (
+                    self.options.target_aware_mask
+                    and track is not None
+                    and global_mask is not None
+                ):
+                    target_mask = temp_dir / "target_identity_mask_global.mkv"
+                    with profile_span(
+                        "dreamidv.target_mask.global",
+                        requested_frames=requested_frames,
+                    ):
+                        target_mask_stats = build_target_aware_mask_video(
+                            ffmpeg=ffmpeg,
+                            source_mask=global_mask,
+                            destination=target_mask,
+                            track=track,
+                            requested_frames=requested_frames,
+                            fps=self.options.sample_fps,
+                            expand=self.options.target_mask_expand,
+                            min_raw_coverage=self.options.target_mask_min_raw_coverage,
+                        )
+                    global_mask = target_mask
+                    profile_event(
+                        "dreamidv.target_mask.summary",
+                        scope="global",
+                        **target_mask_stats.as_dict(),
+                    )
+                    if target_mask_stats.frames_with_multiple_targets:
+                        console.print(
+                            "[green]DreamID-V:[/green] máscara multiinstancia activa "
+                            f"en {target_mask_stats.frames_with_multiple_targets} frames "
+                            "(actor/reflejos)."
                         )
 
-                for clip in clips:
-                    source_clip = temp_dir / (
-                        f"source_{clip.index:04d}.{self.options.chunk_container}"
-                    )
-                    generated_clip = temp_dir / f"generated_{clip.index:04d}.mp4"
-                    with profile_span(
-                        "dreamidv.clip.extract_source",
-                        clip_index=clip.index,
-                        start_frame=clip.start_frame,
-                    ):
-                        self._extract_chunk(
-                            ffmpeg=ffmpeg,
-                            source=proxy,
-                            destination=source_clip,
-                            start_frame=clip.start_frame,
-                        )
-                    reference = self._select_reference(references, track, clip)
-                    pose_video: Path | None = None
-                    mask_video: Path | None = None
-                    if pose_worker is not None:
-                        pose_dir = temp_dir / f"pose_{clip.index:04d}"
-                        pose_dir.mkdir(parents=True, exist_ok=True)
-                        pose_video = pose_dir / (
-                            f"pose.{self.options.chunk_container}"
-                        )
-                        mask_video = pose_dir / (
-                            f"mask.{self.options.chunk_container}"
-                        )
-                        if global_pose is not None and global_mask is not None:
-                            with profile_span(
-                                "dreamidv.dwpose.extract_clip",
-                                clip_index=clip.index,
-                                start_frame=clip.start_frame,
-                            ):
-                                self._extract_chunk(
-                                    ffmpeg=ffmpeg,
-                                    source=global_pose,
-                                    destination=pose_video,
-                                    start_frame=clip.start_frame,
-                                )
-                                self._extract_chunk(
-                                    ffmpeg=ffmpeg,
-                                    source=global_mask,
-                                    destination=mask_video,
-                                    start_frame=clip.start_frame,
-                                )
-                        else:
-                            console.print(
-                                f"[cyan]DWPose:[/cyan] clip {clip.index + 1}/{len(clips)}"
+                prefetch_enabled = bool(
+                    self.options.clip_prefetch > 0
+                    and use_persistent_worker
+                    and global_pose is not None
+                    and global_mask is not None
+                )
+                if not prefetch_enabled:
+                    for clip in clips:
+                        prepared.append(
+                            self._prepare_clip_artifacts(
+                                ffmpeg=ffmpeg,
+                                temp_dir=temp_dir,
+                                clip=clip,
+                                proxy=proxy,
+                                references=references,
+                                track=track,
+                                global_pose=global_pose,
+                                global_mask=global_mask,
+                                pose_worker=pose_worker,
                             )
-                            with profile_span(
-                                "dreamidv.dwpose.clip",
-                                clip_index=clip.index,
-                            ):
-                                pose_worker.generate(
-                                    input_video=source_clip,
-                                    pose_video=pose_video,
-                                    mask_video=mask_video,
-                                )
-                    prepared.append(
-                        DreamIDVPreparedClip(
-                            clip=clip,
-                            source_clip=source_clip,
-                            generated_clip=generated_clip,
-                            source_reference=reference.path,
-                            pose_video=pose_video,
-                            mask_video=mask_video,
                         )
-                    )
             finally:
                 if pose_worker is not None:
                     with profile_span("dreamidv.dwpose.worker_close"):
@@ -1014,17 +1053,31 @@ class DreamIDVSubprocessBackend:
             worker_failed = False
             worker_restarts = 0
             worker_clip_reports: list[dict[str, Any]] = []
-            if use_persistent_worker:
-                if not self.options.precompute_pose:
-                    raise RuntimeError(
-                        "persistent_worker requiere precompute_pose=true para evitar "
-                        "que DWPose y Wan compartan VRAM."
-                    )
-                with profile_span("dreamidv.worker.client_create"):
-                    worker = DreamIDVPersistentClient(self.options, self.checkpoint)
+            prepared_items = (
+                self._prefetched_prepared_clips(
+                    ffmpeg=ffmpeg,
+                    temp_dir=temp_dir,
+                    clips=clips,
+                    proxy=proxy,
+                    references=references,
+                    track=track,
+                    global_pose=global_pose,
+                    global_mask=global_mask,
+                )
+                if prefetch_enabled and global_pose is not None and global_mask is not None
+                else iter(prepared)
+            )
 
             try:
-                for item in prepared:
+                if use_persistent_worker:
+                    if not self.options.precompute_pose:
+                        raise RuntimeError(
+                            "persistent_worker requiere precompute_pose=true para evitar "
+                            "que DWPose y Wan compartan VRAM."
+                        )
+                    with profile_span("dreamidv.worker.client_create"):
+                        worker = DreamIDVPersistentClient(self.options, self.checkpoint)
+                for item in prepared_items:
                     clip = item.clip
                     console.print(
                         f"[cyan]DreamID-V:[/cyan] clip {clip.index + 1}/{len(clips)}, "
@@ -1120,6 +1173,9 @@ class DreamIDVSubprocessBackend:
                         )
                     generated.append((clip, item.generated_clip, item.source_clip))
             finally:
+                close_prepared = getattr(prepared_items, "close", None)
+                if callable(close_prepared):
+                    close_prepared()
                 if worker is not None:
                     worker.close()
 
@@ -1163,6 +1219,14 @@ class DreamIDVSubprocessBackend:
                 "offload_vae_during_dit": self.options.offload_vae_during_dit,
                 "vae_dtype": self.options.vae_dtype,
                 "stream_video_write": self.options.stream_video_write,
+                "optimize_model_invariants": self.options.optimize_model_invariants,
+                "optimize_scheduler_tensors": self.options.optimize_scheduler_tensors,
+                "sdpa_zero_copy_qkv": self.options.sdpa_zero_copy_qkv,
+                "clip_prefetch": self.options.clip_prefetch,
+                "pose_cache_enabled": self.options.pose_cache_enabled,
+                "target_aware_mask": self.options.target_aware_mask,
+                "target_mask_expand": self.options.target_mask_expand,
+                "target_mask_min_raw_coverage": self.options.target_mask_min_raw_coverage,
                 "worker_clip_reports": worker_clip_reports,
                 "worker_restart_attempts": self.options.worker_restart_attempts,
                 "worker_restarts": worker_restarts,
@@ -1192,6 +1256,381 @@ class DreamIDVSubprocessBackend:
                 },
             },
         )
+
+    @staticmethod
+    def _quick_file_signature(path: Path) -> dict[str, Any]:
+        """Firma completa para no reutilizar pose de contenido diferente.
+
+        El nombre histórico se conserva por compatibilidad interna. Hashing de
+        streaming añade pocos segundos frente a varios minutos de DWPose y evita
+        falsos hits si cambia una zona intermedia del archivo manteniendo tamaño.
+        """
+
+        stat = path.stat()
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while chunk := handle.read(8 * 1024 * 1024):
+                digest.update(chunk)
+        return {
+            "path": str(path.resolve()),
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+            "sha256": digest.hexdigest(),
+        }
+
+    def _pose_cache_entry(
+        self,
+        request: VideoSwapRequest,
+        *,
+        requested_frames: int,
+    ) -> tuple[Path, Path, Path, str]:
+        pose_models = self.options.repository_path / "pose" / "models"
+        model_stats: dict[str, Any] = {}
+        for name in ("dw-ll_ucoco_384.onnx", "yolox_l.onnx"):
+            path = pose_models / name
+            if path.is_file():
+                stat = path.stat()
+                model_stats[name] = {
+                    "size": int(stat.st_size),
+                    "mtime_ns": int(stat.st_mtime_ns),
+                }
+        pose_code_stats: dict[str, Any] = {}
+        pose_root = self.options.repository_path / "pose"
+        if pose_root.is_dir():
+            for path in sorted(pose_root.rglob("*.py")):
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                pose_code_stats[str(path.relative_to(pose_root))] = {
+                    "size": int(stat.st_size),
+                    "mtime_ns": int(stat.st_mtime_ns),
+                }
+        payload = {
+            "input": self._quick_file_signature(request.input_video),
+            "size": self.options.size,
+            "sample_fps": self.options.sample_fps,
+            "requested_frames": requested_frames,
+            "hdr_policy": self.options.hdr_policy,
+            "variant": self.options.variant,
+            "pose_models": model_stats,
+            "pose_code": pose_code_stats,
+            "cache_schema": 2,
+        }
+        key = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:32]
+        root = request.output_video.parent / ".faceswap_cache" / "dreamidv_pose"
+        entry = root / key
+        return entry, entry / "pose.mp4", entry / "mask.mp4", key
+
+    def _load_cached_global_pose(
+        self, request: VideoSwapRequest, *, requested_frames: int
+    ) -> tuple[Path, Path] | None:
+        if not self.options.pose_cache_enabled:
+            return None
+        try:
+            entry, pose, mask, key = self._pose_cache_entry(
+                request, requested_frames=requested_frames
+            )
+            if not pose.is_file() or not mask.is_file():
+                profile_event("dreamidv.dwpose.cache", cache_hit=False, cache_key=key)
+                return None
+            if pose.stat().st_size <= 0 or mask.stat().st_size <= 0:
+                shutil.rmtree(entry, ignore_errors=True)
+                return None
+            pose_meta = probe_video(pose)
+            mask_meta = probe_video(mask)
+            expected_width, expected_height = (
+                int(value) for value in self.options.size.split("*", 1)
+            )
+            valid = (
+                pose_meta.frame_count >= requested_frames
+                and mask_meta.frame_count >= requested_frames
+                and pose_meta.width == expected_width
+                and pose_meta.height == expected_height
+                and mask_meta.width == expected_width
+                and mask_meta.height == expected_height
+                and abs(float(pose_meta.fps) - self.options.sample_fps) <= 0.05
+                and abs(float(mask_meta.fps) - self.options.sample_fps) <= 0.05
+            )
+            if not valid:
+                shutil.rmtree(entry, ignore_errors=True)
+                profile_event(
+                    "dreamidv.dwpose.cache",
+                    cache_hit=False,
+                    cache_key=key,
+                    invalid_entry=True,
+                    pose_metadata={
+                        "fps": pose_meta.fps,
+                        "width": pose_meta.width,
+                        "height": pose_meta.height,
+                        "frame_count": pose_meta.frame_count,
+                    },
+                    mask_metadata={
+                        "fps": mask_meta.fps,
+                        "width": mask_meta.width,
+                        "height": mask_meta.height,
+                        "frame_count": mask_meta.frame_count,
+                    },
+                )
+                return None
+            os.utime(entry, None)
+            profile_event(
+                "dreamidv.dwpose.cache",
+                cache_hit=True,
+                cache_key=key,
+                pose_video=str(pose),
+                mask_video=str(mask),
+            )
+            return pose, mask
+        except Exception as exc:  # noqa: BLE001 - la caché nunca bloquea inferencia
+            log_external(
+                "WARNING",
+                "No se pudo leer la caché global DWPose",
+                source="dreamidv_parent",
+                error=str(exc),
+            )
+            return None
+
+    def _store_cached_global_pose(
+        self,
+        request: VideoSwapRequest,
+        *,
+        requested_frames: int,
+        pose_source: Path,
+        mask_source: Path,
+    ) -> tuple[Path, Path]:
+        if not self.options.pose_cache_enabled:
+            return pose_source, mask_source
+        try:
+            entry, pose, mask, key = self._pose_cache_entry(
+                request, requested_frames=requested_frames
+            )
+            entry.mkdir(parents=True, exist_ok=True)
+            pose_tmp = entry / f"pose.{uuid.uuid4().hex}.tmp.mp4"
+            mask_tmp = entry / f"mask.{uuid.uuid4().hex}.tmp.mp4"
+            shutil.copy2(pose_source, pose_tmp)
+            shutil.copy2(mask_source, mask_tmp)
+            os.replace(pose_tmp, pose)
+            os.replace(mask_tmp, mask)
+            (entry / "cache.json").write_text(
+                json.dumps(
+                    {
+                        "cache_key": key,
+                        "requested_frames": requested_frames,
+                        "sample_fps": self.options.sample_fps,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            root = entry.parent
+            entries = sorted(
+                (candidate for candidate in root.iterdir() if candidate.is_dir()),
+                key=lambda candidate: candidate.stat().st_mtime_ns,
+                reverse=True,
+            )
+            for stale in entries[self.options.pose_cache_max_entries :]:
+                if stale != entry:
+                    shutil.rmtree(stale, ignore_errors=True)
+            profile_event(
+                "dreamidv.dwpose.cache_store", cache_key=key, cache_entry=str(entry)
+            )
+            return pose, mask
+        except Exception as exc:  # noqa: BLE001
+            log_external(
+                "WARNING",
+                "No se pudo guardar la caché global DWPose",
+                source="dreamidv_parent",
+                error=str(exc),
+            )
+            return pose_source, mask_source
+
+    def _prepare_clip_artifacts(
+        self,
+        *,
+        ffmpeg: Path,
+        temp_dir: Path,
+        clip: DreamIDVClip,
+        proxy: Path,
+        references: Sequence[VideoReference],
+        track: TargetTrack | None,
+        global_pose: Path | None,
+        global_mask: Path | None,
+        pose_worker: DreamIDVPoseClient | None,
+    ) -> DreamIDVPreparedClip:
+        source_clip = temp_dir / (
+            f"source_{clip.index:04d}.{self.options.chunk_container}"
+        )
+        generated_clip = temp_dir / f"generated_{clip.index:04d}.mp4"
+        with profile_span(
+            "dreamidv.clip.extract_source",
+            clip_index=clip.index,
+            start_frame=clip.start_frame,
+        ):
+            self._extract_chunk(
+                ffmpeg=ffmpeg,
+                source=proxy,
+                destination=source_clip,
+                start_frame=clip.start_frame,
+            )
+        reference = self._select_reference(references, track, clip)
+        pose_video: Path | None = None
+        mask_video: Path | None = None
+        if global_pose is not None and global_mask is not None:
+            pose_dir = temp_dir / f"pose_{clip.index:04d}"
+            pose_dir.mkdir(parents=True, exist_ok=True)
+            pose_video = pose_dir / f"pose.{self.options.chunk_container}"
+            mask_video = pose_dir / f"mask.{self.options.chunk_container}"
+            with profile_span(
+                "dreamidv.dwpose.extract_clip",
+                clip_index=clip.index,
+                start_frame=clip.start_frame,
+            ):
+                self._extract_chunk(
+                    ffmpeg=ffmpeg,
+                    source=global_pose,
+                    destination=pose_video,
+                    start_frame=clip.start_frame,
+                )
+                self._extract_chunk(
+                    ffmpeg=ffmpeg,
+                    source=global_mask,
+                    destination=mask_video,
+                    start_frame=clip.start_frame,
+                )
+        elif pose_worker is not None:
+            pose_dir = temp_dir / f"pose_{clip.index:04d}"
+            pose_dir.mkdir(parents=True, exist_ok=True)
+            pose_video = pose_dir / f"pose.{self.options.chunk_container}"
+            raw_mask_video = pose_dir / f"mask_raw.{self.options.chunk_container}"
+            console.print(f"[cyan]DWPose:[/cyan] clip {clip.index + 1}")
+            with profile_span("dreamidv.dwpose.clip", clip_index=clip.index):
+                pose_worker.generate(
+                    input_video=source_clip,
+                    pose_video=pose_video,
+                    mask_video=raw_mask_video,
+                )
+            if self.options.target_aware_mask and track is not None:
+                mask_video = pose_dir / f"mask.{self.options.chunk_container}"
+                with profile_span(
+                    "dreamidv.target_mask.clip",
+                    clip_index=clip.index,
+                    start_frame=clip.start_frame,
+                ):
+                    target_mask_stats = build_target_aware_mask_video(
+                        ffmpeg=ffmpeg,
+                        source_mask=raw_mask_video,
+                        destination=mask_video,
+                        track=track,
+                        requested_frames=self.options.frame_num,
+                        fps=self.options.sample_fps,
+                        start_frame=clip.start_frame,
+                        valid_frames=clip.valid_frames,
+                        expand=self.options.target_mask_expand,
+                        min_raw_coverage=self.options.target_mask_min_raw_coverage,
+                    )
+                profile_event(
+                    "dreamidv.target_mask.summary",
+                    scope="clip",
+                    clip_index=clip.index,
+                    **target_mask_stats.as_dict(),
+                )
+            else:
+                mask_video = raw_mask_video
+        return DreamIDVPreparedClip(
+            clip=clip,
+            source_clip=source_clip,
+            generated_clip=generated_clip,
+            source_reference=reference.path,
+            pose_video=pose_video,
+            mask_video=mask_video,
+        )
+
+    def _prefetched_prepared_clips(
+        self,
+        *,
+        ffmpeg: Path,
+        temp_dir: Path,
+        clips: Sequence[DreamIDVClip],
+        proxy: Path,
+        references: Sequence[VideoReference],
+        track: TargetTrack | None,
+        global_pose: Path,
+        global_mask: Path,
+    ):
+        """Inicia inmediatamente un productor acotado de clips.
+
+        La función devuelve un generador consumidor, pero el hilo se arranca antes
+        de retornarlo. Así, la extracción del primer clip puede solaparse con la
+        inicialización del worker Wan, además de solaparse con clips posteriores.
+        """
+
+        capacity = max(1, int(self.options.clip_prefetch))
+        items: queue.Queue[Any] = queue.Queue(maxsize=capacity)
+        sentinel = object()
+        stop = threading.Event()
+
+        def put(value: Any) -> bool:
+            while not stop.is_set():
+                try:
+                    items.put(value, timeout=0.2)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def produce() -> None:
+            try:
+                for clip in clips:
+                    if stop.is_set():
+                        break
+                    prepared = self._prepare_clip_artifacts(
+                        ffmpeg=ffmpeg,
+                        temp_dir=temp_dir,
+                        clip=clip,
+                        proxy=proxy,
+                        references=references,
+                        track=track,
+                        global_pose=global_pose,
+                        global_mask=global_mask,
+                        pose_worker=None,
+                    )
+                    if not put(prepared):
+                        return
+            except BaseException as exc:  # noqa: BLE001 - se propaga al consumidor
+                put(exc)
+            finally:
+                put(sentinel)
+
+        thread = threading.Thread(
+            target=produce, name="dreamidv-clip-prefetch", daemon=True
+        )
+        thread.start()
+        profile_event(
+            "dreamidv.clip_prefetch",
+            enabled=True,
+            queue_capacity=capacity,
+            clip_count=len(clips),
+            started_before_worker=True,
+        )
+
+        def consume():
+            try:
+                while True:
+                    value = items.get()
+                    if value is sentinel:
+                        break
+                    if isinstance(value, BaseException):
+                        raise value
+                    yield value
+            finally:
+                stop.set()
+                thread.join()
+
+        return consume()
 
     def _prepare_source_proxy(
         self,
@@ -1566,6 +2005,11 @@ class DreamIDVBackendFactory:
                 "offload_vae_during_dit": options.offload_vae_during_dit,
                 "vae_dtype": options.vae_dtype,
                 "stream_video_write": options.stream_video_write,
+                "optimize_model_invariants": options.optimize_model_invariants,
+                "optimize_scheduler_tensors": options.optimize_scheduler_tensors,
+                "sdpa_zero_copy_qkv": options.sdpa_zero_copy_qkv,
+                "clip_prefetch": options.clip_prefetch,
+                "pose_cache_enabled": options.pose_cache_enabled,
                 "worker_restart_attempts": options.worker_restart_attempts,
                 "release_analysis_gpu": options.release_analysis_gpu,
                 "sdpa_backend_priority": options.sdpa_backend_priority,

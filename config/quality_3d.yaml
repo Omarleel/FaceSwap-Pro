@@ -99,3 +99,6 @@ performance:
   max_inflight: 2
   postprocess_workers: 1
   opencv_threads: 0
+
+provenance:
+  visible_disclosure: false

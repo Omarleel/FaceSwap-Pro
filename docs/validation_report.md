@@ -5,12 +5,12 @@ Fecha de validación del paquete: 2026-08-03.
 ## Resultado automatizado
 
 ```text
-73 passed
+109 passed
 ```
 
 La suite incluye las pruebas existentes y regresiones nuevas para planificación de
 clips, tracking multiinstancia del actor y su reflexión, reconocimiento reservado
-por trayectoria, doble composición por frame, unión de máscaras DreamID-V, banco
+por trayectoria, doble composición por frame, máscara DreamID-V multiinstancia antes de difusión, banco
 multi-referencia, hoja visual, hashes cacheados, metadatos de color y C2PA.
 
 ## Prueba FFmpeg real

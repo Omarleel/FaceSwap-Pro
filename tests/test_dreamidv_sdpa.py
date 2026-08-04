@@ -115,3 +115,64 @@ def test_attention_override_is_installed_for_dreamidv_package():
             sys.modules.pop(target, None)
         else:
             sys.modules[target] = previous
+
+
+def test_zero_copy_qkv_attempts_transposed_views_first(monkeypatch):
+    _math_environment(monkeypatch)
+    monkeypatch.setenv("FACESWAP_SDPA_PADDING_MODE", "ragged")
+    monkeypatch.setenv("FACESWAP_SDPA_ZERO_COPY_QKV", "1")
+    dreamidv_sdpa._reset_backend_cache_for_tests()
+
+    calls: list[tuple[bool, bool, bool]] = []
+    original = dreamidv_sdpa._call_sdpa
+
+    def observed(q, k, v, **kwargs):
+        calls.append((q.is_contiguous(), k.is_contiguous(), v.is_contiguous()))
+        return original(q, k, v, **kwargs)
+
+    monkeypatch.setattr(dreamidv_sdpa, "_call_sdpa", observed)
+    q = torch.randn(1, 5, 2, 8, dtype=torch.bfloat16)
+    k = torch.randn(1, 5, 2, 8, dtype=torch.bfloat16)
+    v = torch.randn(1, 5, 2, 8, dtype=torch.bfloat16)
+
+    dreamidv_sdpa.attention(q, k, v, q_lens=[5], k_lens=[5])
+
+    assert calls
+    assert calls[0] == (False, False, False)
+
+
+def test_q_scale_keeps_original_low_precision_rounding_order(monkeypatch):
+    _math_environment(monkeypatch)
+    monkeypatch.setenv("FACESWAP_SDPA_PADDING_MODE", "ragged")
+    monkeypatch.setenv("FACESWAP_SDPA_ZERO_COPY_QKV", "0")
+    dreamidv_sdpa._reset_backend_cache_for_tests()
+
+    captured: list[torch.Tensor] = []
+    original = dreamidv_sdpa._call_sdpa
+
+    def observed(q, k, v, **kwargs):
+        captured.append(q.detach().clone())
+        return original(q, k, v, **kwargs)
+
+    monkeypatch.setattr(dreamidv_sdpa, "_call_sdpa", observed)
+    torch.manual_seed(23)
+    q = torch.randn(1, 7, 2, 8, dtype=torch.bfloat16)
+    k = torch.randn(1, 7, 2, 8, dtype=torch.bfloat16)
+    v = torch.randn(1, 7, 2, 8, dtype=torch.bfloat16)
+
+    dreamidv_sdpa.attention(
+        q, k, v, q_lens=[7], k_lens=[7], q_scale=0.375, softmax_scale=0.25
+    )
+
+    expected_q = (q.transpose(1, 2) * 0.375).contiguous()
+    torch.testing.assert_close(captured[0], expected_q, rtol=0, atol=0)
+
+
+
+def test_length_cache_accepts_inference_tensor_without_version_counter():
+    from faceswap_pro.dreamidv_sdpa import _length_values
+
+    with torch.inference_mode():
+        lengths = torch.tensor([7], dtype=torch.long)
+        assert _length_values(lengths, batch=1, maximum=9) == (7,)
+        assert _length_values(lengths, batch=1, maximum=9) == (7,)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,7 +11,9 @@ import numpy as np
 import pytest
 
 from faceswap_pro.dreamidv_backend import (
+    DreamIDVClip,
     DreamIDVOptions,
+    DreamIDVPreparedClip,
     DreamIDVSubprocessBackend,
     build_dreamidv_command,
     dreamidv_readiness,
@@ -247,6 +250,12 @@ def test_dreamidv_defaults_isolate_gpu_phases(tmp_path):
     assert options.profile_detailed_clips == 1
     assert options.worker_restart_attempts == 1
     assert options.release_analysis_gpu is True
+    assert options.optimize_model_invariants is True
+    assert options.optimize_scheduler_tensors is True
+    assert options.sdpa_zero_copy_qkv is True
+    assert options.clip_prefetch == 2
+    assert options.pose_cache_enabled is True
+    assert options.pose_cache_max_entries == 8
 
 
 def test_dreamidv_rejects_unknown_vae_dtype(tmp_path):
@@ -377,3 +386,63 @@ def test_dreamidv_worker_profiles_gpu_and_uses_adaptive_cuda_cleanup():
     assert "context_cache_hit" in worker
     assert "reference_latent_cache_hit" in worker
     assert "process_dwpose" in pose_worker
+
+
+def test_clip_prefetch_starts_before_first_item_is_requested(tmp_path, monkeypatch):
+    options = DreamIDVOptions.from_config(
+        _config(tmp_path, persistent_worker=True, clip_prefetch=1)
+    )
+    backend = DreamIDVSubprocessBackend(tmp_path / "model.pth", options)
+    started = threading.Event()
+    clip = DreamIDVClip(0, 0, 49, 0, False, 42)
+    reference = tmp_path / "ref.png"
+    reference.write_bytes(b"ref")
+
+    def prepare(**kwargs):
+        started.set()
+        current = kwargs["clip"]
+        return DreamIDVPreparedClip(
+            clip=current,
+            source_clip=tmp_path / "source.mkv",
+            generated_clip=tmp_path / "generated.mp4",
+            source_reference=reference,
+            pose_video=tmp_path / "pose.mkv",
+            mask_video=tmp_path / "mask.mkv",
+        )
+
+    monkeypatch.setattr(backend, "_prepare_clip_artifacts", prepare)
+    iterator = backend._prefetched_prepared_clips(
+        ffmpeg=Path("ffmpeg"),
+        temp_dir=tmp_path,
+        clips=[clip],
+        proxy=tmp_path / "proxy.mkv",
+        references=[],
+        track=None,
+        global_pose=tmp_path / "pose.mp4",
+        global_mask=tmp_path / "mask.mp4",
+    )
+    try:
+        assert started.wait(timeout=1.0)
+        assert next(iterator).clip == clip
+    finally:
+        iterator.close()
+
+
+def test_pose_cache_key_changes_with_processing_resolution(tmp_path):
+    input_video = tmp_path / "input.mp4"
+    input_video.write_bytes(b"video-content")
+    output_video = tmp_path / "output.mp4"
+    request = SimpleNamespace(input_video=input_video, output_video=output_video)
+
+    first = DreamIDVSubprocessBackend(
+        tmp_path / "model.pth",
+        DreamIDVOptions.from_config(_config(tmp_path, size="832*480")),
+    )
+    second = DreamIDVSubprocessBackend(
+        tmp_path / "model.pth",
+        DreamIDVOptions.from_config(_config(tmp_path, size="1280*720")),
+    )
+
+    assert first._pose_cache_entry(request, requested_frames=49)[3] != second._pose_cache_entry(
+        request, requested_frames=49
+    )[3]

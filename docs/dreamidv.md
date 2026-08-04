@@ -98,11 +98,24 @@ perder algo de detalle frente al perfil de 16 pasos.
 7. **Limpieza por cambio de etapa.** `empty_cache()` se ejecuta después de mover
    un módulo pesado a CPU, tras un OOM o cuando existe memoria reservada inactiva
    relevante. No se vacía el allocator después de cada operación.
-8. **Reinicio controlado.** Si el worker falla, se cierra para liberar toda su VRAM
+8. **Invariantes del DiT.** Sin cambiar pasos, guía ni pesos, el worker reutiliza
+   RoPE, embeddings temporales y las proyecciones K/V del contexto textual entre
+   las pasadas condicionada/no condicionada. Las cachés se asocian al tensor raíz
+   vivo y se vacían antes del VAE decode para no retener VRAM entre etapas.
+9. **Máscara multiinstancia por identidad.** La máscara facial de DWPose se
+   compara con las trayectorias InsightFace antes de entrar al VAE. Los componentes
+   que no pertenecen al actor se descartan; el rostro principal conserva la máscara
+   DWPose y cada reflejo o aparición faltante recibe una máscara geométrica estable.
+   El evento `dreamidv.target_mask.summary` informa cuántos frames tenían varias
+   apariciones y cuántas máscaras sintéticas se añadieron.
+10. **Preparación solapada y caché DWPose.** La pose global se reutiliza cuando no
+   cambian el vídeo, FPS, longitud o modelos ONNX. Un productor acotado extrae los
+   clips siguientes mientras la GPU genera el actual.
+11. **Reinicio controlado.** Si el worker falla, se cierra para liberar toda su VRAM
    y se vuelve a crear según `worker_restart_attempts`. Con
    `worker_fallback: false`, la ejecución se detiene en lugar de caer a una CLI
    mucho más lenta.
-9. **Stitching y composición.** Las ventanas se mezclan en los solapes y el vídeo
+12. **Stitching y composición.** Las ventanas se mezclan en los solapes y el vídeo
    original se conserva fuera de las máscaras del actor y su reflexión.
 
 
@@ -160,6 +173,7 @@ Configuración recomendada para una RTX 5060 Ti/5070 Ti de 16 GB:
 sdpa_backend_priority: [cudnn, flash, efficient, math]
 sdpa_allow_math_fallback: false
 sdpa_padding_mode: ragged
+sdpa_zero_copy_qkv: true
 sdpa_diagnostics: true
 ```
 
@@ -212,6 +226,11 @@ t5_cpu: true
 cache_context: true
 cache_reference_latents: true
 reference_latent_cache_size: 8
+optimize_model_invariants: true
+optimize_scheduler_tensors: true
+clip_prefetch: 2
+pose_cache_enabled: true
+pose_cache_max_entries: 8
 cuda_cleanup_mode: adaptive
 cuda_cleanup_reserved_ratio: 0.82
 ```

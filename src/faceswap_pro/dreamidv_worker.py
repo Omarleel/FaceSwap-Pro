@@ -83,6 +83,8 @@ def _arguments() -> argparse.Namespace:
         default="auto",
     )
     parser.add_argument("--stream-video-write", action="store_true")
+    parser.add_argument("--optimize-model-invariants", action="store_true")
+    parser.add_argument("--optimize-scheduler-tensors", action="store_true")
     return parser.parse_args()
 
 
@@ -381,6 +383,8 @@ class WorkerRuntime:
         self._context_cache_enabled = bool(args.cache_context)
         self._reference_cache_enabled = bool(args.cache_reference_latents)
         self._original_torch_load: Callable[..., Any] | None = None
+        self._invariant_optimizer: Any | None = None
+        self._scheduler_torch_proxy: Any | None = None
 
         with self.profiler.span("dreamidv.initialize.imports"):
             from faceswap_pro.dreamidv_sdpa import (
@@ -449,6 +453,8 @@ class WorkerRuntime:
             offload_vae_during_dit=bool(args.offload_vae_during_dit),
             vae_dtype=str(args.vae_dtype),
             stream_video_write=bool(args.stream_video_write),
+            optimize_model_invariants=bool(args.optimize_model_invariants),
+            optimize_scheduler_tensors=bool(args.optimize_scheduler_tensors),
         )
 
     def _detailed_profile_enabled(self) -> bool:
@@ -478,6 +484,32 @@ class WorkerRuntime:
         self._configure_vae_precision()
         self._patch_temporal_vae_concat()
         self._patch_vae_wrappers()
+        if self.args.optimize_model_invariants:
+            try:
+                from faceswap_pro.dreamidv_invariants import DreamIDVInvariantOptimizer
+
+                self._invariant_optimizer = DreamIDVInvariantOptimizer(
+                    package_name=self.package_name,
+                    model=self.pipeline.model,
+                    torch_module=self.torch,
+                    attention_dtype=getattr(
+                        self.pipeline, "param_dtype", self.torch.bfloat16
+                    ),
+                    event=self.profiler.event,
+                )
+                if not self._invariant_optimizer.install():
+                    self._invariant_optimizer = None
+                    self.profiler.log(
+                        "WARNING",
+                        "El checkout DreamID-V no expone las funciones invariantes esperadas",
+                    )
+            except Exception as exc:
+                self._invariant_optimizer = None
+                self.profiler.log(
+                    "WARNING",
+                    "No se pudieron instalar las cachés invariantes DreamID-V",
+                    error=str(exc),
+                )
         self._patch_faster_generate()
 
     def _resolved_vae_dtype(self) -> Any:
@@ -744,6 +776,18 @@ class WorkerRuntime:
                 f"{self.package_name}.utils.fm_solvers_unipc"
             )
             scheduler_class = scheduler_module.FlowUniPCMultistepScheduler
+            if (
+                self._invariant_optimizer is not None
+                and self.args.optimize_scheduler_tensors
+            ):
+                self._scheduler_torch_proxy = (
+                    self._invariant_optimizer.install_scheduler_proxy(scheduler_module)
+                )
+                self.profiler.event(
+                    "dreamidv.optimization",
+                    optimization="unipc_tensor_proxy",
+                    enabled=True,
+                )
         except Exception as exc:
             self.profiler.log(
                 "WARNING",
@@ -804,21 +848,9 @@ class WorkerRuntime:
                 seed = __import__("random").randint(0, sys.maxsize)
             generator = torch.Generator(device=device)
             generator.manual_seed(seed)
-            context = torch.load(f"{runtime.package_name}/context.pth")
-            context = [tensor.to(device=device, non_blocking=True) for tensor in context]
+            raw_context = torch.load(f"{runtime.package_name}/context.pth")
             conditioned = torch.concat([latents_ref_video, mask])
-            args_conditioned = {
-                "context": context,
-                "seq_len": seq_len,
-                "y": [conditioned],
-                "img_ref": [latents_ref_image],
-            }
-            args_unconditioned = {
-                "context": context,
-                "seq_len": seq_len,
-                "y": [conditioned],
-                "img_ref": [torch.zeros_like(latents_ref_image)],
-            }
+            zero_reference = torch.zeros_like(latents_ref_image)
             noise = [
                 torch.randn(
                     *target_shape,
@@ -835,6 +867,30 @@ class WorkerRuntime:
 
             no_sync = getattr(pipeline_self.model, "no_sync", contextlib.nullcontext)
             with runtime._autocast_context(dtype), torch.inference_mode(), no_sync():
+                if runtime._invariant_optimizer is not None:
+                    with runtime.profiler.span(
+                        "dreamidv.stage.context_encode_cached", cuda=True
+                    ):
+                        context = runtime._invariant_optimizer.encode_context(
+                            raw_context, device=device
+                        )
+                else:
+                    context = [
+                        tensor.to(device=device, non_blocking=True)
+                        for tensor in raw_context
+                    ]
+                args_conditioned = {
+                    "context": context,
+                    "seq_len": seq_len,
+                    "y": [conditioned],
+                    "img_ref": [latents_ref_image],
+                }
+                args_unconditioned = {
+                    "context": context,
+                    "seq_len": seq_len,
+                    "y": [conditioned],
+                    "img_ref": [zero_reference],
+                }
                 if sample_solver != "unipc":
                     raise NotImplementedError("DreamID-V Faster optimizado admite unipc.")
                 scheduler = scheduler_class(
@@ -845,7 +901,7 @@ class WorkerRuntime:
                 scheduler.set_timesteps(sampling_steps, device=device, shift=shift)
                 latents = noise
                 for timestep in scheduler.timesteps:
-                    timestep_batch = torch.stack([timestep])
+                    timestep_batch = timestep.reshape(1)
                     positive = pipeline_self.model(
                         latents, t=timestep_batch, **args_conditioned
                     )[0]
@@ -864,8 +920,10 @@ class WorkerRuntime:
                     del positive, negative, noise_prediction, next_latent
                 decoded_latents = latents
 
-            del noise, scheduler, context, conditioned
+            del noise, scheduler, context, raw_context, conditioned, zero_reference
             del args_conditioned, args_unconditioned, latents_ref_video, latents_ref_image, mask
+            if runtime._invariant_optimizer is not None:
+                runtime._invariant_optimizer.clear_clip_caches()
             if staged or offload_model:
                 runtime._move_dit("cpu", stage="before_vae_decode")
                 runtime._release_cuda_cache(stage="after_dit_offload")
@@ -1291,6 +1349,15 @@ class WorkerRuntime:
         cleanup = self._cleanup_cuda(force=False, offload_model=actual_offload)
         elapsed = time.perf_counter() - started
         self.profiler.gpu_snapshot("clip_end")
+        optimization_metrics: dict[str, Any] = {}
+        if self._invariant_optimizer is not None:
+            optimization_metrics["model_invariants"] = dict(
+                self._invariant_optimizer.summary()
+            )
+        if self._scheduler_torch_proxy is not None:
+            optimization_metrics["scheduler_tensors"] = dict(
+                self._scheduler_torch_proxy.summary()
+            )
         summary = self.profiler.summary(
             request_id=request_id,
             elapsed_seconds=elapsed,
@@ -1298,6 +1365,7 @@ class WorkerRuntime:
             actual_offload_model=actual_offload,
             oom_fallback_used=oom_fallback_used,
             cuda_cleanup=cleanup,
+            optimization_metrics=optimization_metrics,
         )
         self.profiler.clear_request()
         return summary

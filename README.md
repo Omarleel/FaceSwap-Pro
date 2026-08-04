@@ -150,6 +150,20 @@ sale de CUDA durante la codificación/decodificación VAE y el VAE sale durante 
 difusión. El VAE se ejecuta en BF16, el modelo se mueve una sola vez por etapa y
 la salida se codifica por fotograma, evitando una copia FP32 del clip completo.
 
+La versión 0.5.4 conserva los mismos pasos, resolución, guía y solape de cada
+perfil. Optimiza únicamente trabajo redundante: Q/K/V se entregan a SDPA como
+vistas cuando el kernel lo admite, RoPE y embeddings invariantes se reutilizan
+entre las dos pasadas de guidance, y los tensores pequeños de UniPC evitan rutas
+CPU innecesarias. Cada optimización tiene fallback automático al comportamiento
+compatible del checkout externo. La revisión 0.5.4 también hace las cachés
+compatibles con ``torch.inference_mode`` y garantiza que las cachés dependientes
+del clip se liberen antes de volver a cargar el VAE.
+
+DWPose global se guarda en ``.faceswap_cache/dreamidv_pose`` junto al destino y
+se invalida si cambia el vídeo, FPS, número de frames o modelos ONNX. Durante una
+ejecución, un productor acotado prepara los siguientes clips mientras la GPU
+procesa el actual; esto no modifica los frames ni el orden de generación.
+
 Valida primero los archivos y la GPU:
 
 ```powershell
@@ -219,9 +233,11 @@ tracking:
 
 Cada aparición mantiene una trayectoria, suavizado y flujo óptico independientes;
 el orden cambiante del detector no mezcla el rostro directo con su reflexión. En el
-pipeline por fotogramas se genera y compone un reemplazo por rostro. En DreamID-V se
-construye la unión de máscaras de todas las apariciones coincidentes para conservar
-la salida generada en ambas zonas.
+pipeline por fotogramas se genera y compone un reemplazo por rostro. En DreamID-V la
+máscara DWPose se cruza con el tracking **antes de la difusión**: se conserva el
+componente preciso del actor principal y se añaden máscaras para las apariciones
+coincidentes que falten, como reflejos. La composición final vuelve a usar la misma
+unión para conservar intactas las demás personas y el fondo.
 
 Usa `max_target_faces: 1` para recuperar el comportamiento conservador anterior, o
 un valor mayor cuando una escena contenga varios espejos. El límite se aplica solo a

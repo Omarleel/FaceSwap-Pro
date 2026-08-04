@@ -207,7 +207,7 @@ def embed_c2pa_manifest(
                     "@context": "https://schema.org",
                     "@type": "VideoObject",
                     "name": output_video.name,
-                    "description": "Contenido sintético generado mediante reemplazo facial autorizado.",
+                    "description": "Deep fake generado mediante reemplazo facial autorizado.",
                 },
             },
         ],
