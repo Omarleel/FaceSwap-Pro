@@ -230,8 +230,28 @@ def test_dreamidv_defaults_isolate_gpu_phases(tmp_path):
     options = DreamIDVOptions.from_config(_config(tmp_path, persistent_worker=True))
 
     assert options.precompute_pose is True
+    assert options.precompute_pose_global is True
+    assert options.profile_worker is True
+    assert options.profile_dit_forwards is True
+    assert options.profile_worker_cprofile is True
+    assert options.worker_cprofile_top == 80
+    assert options.cache_context is True
+    assert options.cache_reference_latents is True
+    assert options.cuda_cleanup_mode == "adaptive"
+    assert options.offload_fallback is True
+    assert options.staged_offload is True
+    assert options.offload_vae_during_dit is True
+    assert options.vae_dtype == "auto"
+    assert options.stream_video_write is True
+    assert options.profile_worker_cprofile_all is False
+    assert options.profile_detailed_clips == 1
     assert options.worker_restart_attempts == 1
     assert options.release_analysis_gpu is True
+
+
+def test_dreamidv_rejects_unknown_vae_dtype(tmp_path):
+    with pytest.raises(ValueError, match="vae_dtype"):
+        DreamIDVOptions.from_config(_config(tmp_path, vae_dtype="fp8"))
 
 
 def test_persistent_pipeline_closes_pose_worker_before_loading_wan(tmp_path, monkeypatch):
@@ -334,12 +354,13 @@ def test_persistent_pipeline_closes_pose_worker_before_loading_wan(tmp_path, mon
 
     assert output_video.is_file()
     assert events.index("pose-close") < events.index("wan-start")
+    assert events.count("pose-source_proxy") == 1
     assert events.count("wan-generate") == 3
     assert result.metadata["worker_restarts"] == 0
     assert result.metadata["persistent_worker_fallback"] is False
 
 
-def test_dreamidv_worker_uses_precomputed_pose_and_releases_cuda_cache():
+def test_dreamidv_worker_profiles_gpu_and_uses_adaptive_cuda_cleanup():
     worker = Path("src/faceswap_pro/dreamidv_worker.py").read_text(encoding="utf-8")
     pose_worker = Path("src/faceswap_pro/dreamidv_pose_worker.py").read_text(
         encoding="utf-8"
@@ -348,6 +369,11 @@ def test_dreamidv_worker_uses_precomputed_pose_and_releases_cuda_cache():
     assert 'request["pose_video"]' in worker
     assert 'request["mask_video"]' in worker
     assert "process_dwpose" not in worker
-    assert "torch.cuda.empty_cache()" in worker
-    assert "torch.cuda.ipc_collect" not in worker  # se usa getattr por compatibilidad
+    assert "FACESWAP_PROFILE" in worker
+    assert "dreamidv.dit.forward" in worker
+    assert "cuda_duration_ms" in worker
+    assert "cprofile_function" in worker
+    assert "cuda_cleanup_mode" in worker
+    assert "context_cache_hit" in worker
+    assert "reference_latent_cache_hit" in worker
     assert "process_dwpose" in pose_worker

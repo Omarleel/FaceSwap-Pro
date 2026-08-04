@@ -36,13 +36,19 @@ engine:
     sample_solver: unipc
     seed: 42
     seed_mode: absolute_frame
+    # Alterna DiT/VAE en GPU para evitar paginación de VRAM en tarjetas de 16 GB.
     offload_model: true
+    offload_fallback: true
+    staged_offload: true
+    offload_vae_during_dit: true
+    vae_dtype: bfloat16
+    stream_video_write: true
     t5_cpu: true
     device_id: 0
 
     # Ventanas solapadas y cortes de escena. Los intermedios son sin pérdida.
     chunking: true
-    chunk_overlap_frames: 9
+    chunk_overlap_frames: 5
     scene_aware_chunking: true
     scene_cut_window_frames: 12
     chunk_codec: libx264
@@ -54,9 +60,25 @@ engine:
     # DreamID-V permanece cargado entre clips y se reinicia una vez si hay fragmentación.
     persistent_worker: true
     precompute_pose: true
+    # Ejecuta DWPose una sola vez sobre el proxy y recorta pose/máscara por clip.
+    precompute_pose_global: true
     worker_restart_attempts: 1
     worker_fallback: false
     release_analysis_gpu: true
+
+    # Perfilado interno y optimizaciones persistentes del worker DreamID-V.
+    profile_worker: true
+    profile_dit_forwards: true
+    profile_worker_cprofile: true
+    profile_worker_cprofile_all: false
+    profile_detailed_clips: 1
+    worker_cprofile_top: 80
+    worker_heartbeat_seconds: 15
+    cache_context: true
+    cache_reference_latents: true
+    reference_latent_cache_size: 8
+    cuda_cleanup_mode: adaptive
+    cuda_cleanup_reserved_ratio: 0.82
 
     # SDPA nativo: en Windows/Blackwell se intenta cuDNN primero, después
     # FlashAttention y Efficient Attention. MATH queda desactivado para no

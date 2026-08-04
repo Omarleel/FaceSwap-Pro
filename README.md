@@ -143,7 +143,12 @@ el fallback matemático extremadamente lento. Consulta
 
 El perfil `quality_dreamidv.yaml` usa `dreamidv_faster.pth`, 832×480, 49
 fotogramas y 16 pasos. El perfil `speed_dreamidv.yaml` conserva la misma
-resolución pero usa 8 pasos y menos solape para pruebas o vídeos largos.
+resolución pero usa 8 pasos y 5 fotogramas de solape para pruebas o vídeos largos.
+
+En GPU de 16 GB, los perfiles alternan la residencia del DiT y del VAE: el DiT
+sale de CUDA durante la codificación/decodificación VAE y el VAE sale durante la
+difusión. El VAE se ejecuta en BF16, el modelo se mueve una sola vez por etapa y
+la salida se codifica por fotograma, evitando una copia FP32 del clip completo.
 
 Valida primero los archivos y la GPU:
 
@@ -261,8 +266,11 @@ archivos acumulativos en formato JSON Lines:
 - `logs/profile.jsonl`: spans jerárquicos, métricas por fotograma y rostro, esperas de
   colas/futuros, tiempos de decodificación, detección, tracking, swap, composición,
   restauración, alimentación al encoder, memoria Python y estadísticas `cProfile`
-  por función. Cuando el runtime no admite perfiles simultáneos, conserva los spans
-  atómicos y registra explícitamente esa limitación sin detener el procesamiento.
+  por función. En DreamID-V también incorpora la telemetría del worker: carga de
+  modelos, VRAM asignada/reservada, VAE, cada forward del DiT, paso de difusión,
+  pasada condicional/no condicionada, escritura, heartbeats y `cProfile` por clip.
+  Cuando el runtime no admite perfiles simultáneos, conserva los spans atómicos y
+  registra explícitamente esa limitación sin detener el procesamiento.
 
 El archivo de perfil añade también eventos `span_summary` ordenados por tiempo total,
 con conteo, promedio, mínimo, máximo y CPU acumulada por operación. Cada línea incluye

@@ -250,6 +250,22 @@ class ObservabilitySession:
             extra={"event_data": {"event": "problem", **fields}},
         )
 
+    def log_external(
+        self, level_name: str, message: str, *, source: str, **fields: Any
+    ) -> None:
+        level = getattr(logging, str(level_name).upper(), logging.WARNING)
+        self._logger.log(
+            level,
+            message,
+            extra={
+                "event_data": {
+                    "event": "external_log",
+                    "external_source": source,
+                    **fields,
+                }
+            },
+        )
+
     def log_exception(self, message: str, exc: BaseException, **fields: Any) -> None:
         if getattr(exc, "_faceswap_pro_logged", False):
             return
@@ -406,6 +422,12 @@ def log_problem(message: str, **fields: Any) -> None:
         session.log_problem(message, **fields)
 
 
+def log_external(level_name: str, message: str, *, source: str, **fields: Any) -> None:
+    session = current_session()
+    if session is not None:
+        session.log_external(level_name, message, source=source, **fields)
+
+
 def log_exception(message: str, exc: BaseException, **fields: Any) -> None:
     session = current_session()
     if session is not None:
@@ -497,6 +519,7 @@ __all__ = [
     "current_session",
     "function_profile",
     "log_exception",
+    "log_external",
     "log_problem",
     "profile_event",
     "profile_span",
