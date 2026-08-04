@@ -136,8 +136,9 @@ El bloque `hififace_3dmm.ready` debe ser `true`.
 ## Preparar DreamID-V para GPU NVIDIA de 16 GB
 
 DreamID-V puede usar el mismo entorno Conda que los demás backends. El instalador
-selectivo evita duplicar OpenCV u ONNX Runtime CPU y aplica el fallback de atención
-de PyTorch cuando FlashAttention no está disponible en Windows. Consulta
+selectivo evita duplicar OpenCV u ONNX Runtime CPU e instala una ruta SDPA nativa
+que prioriza cuDNN/Flash/Efficient Attention, conserva las longitudes reales y evita
+el fallback matemático extremadamente lento. Consulta
 [`docs/dreamidv.md`](docs/dreamidv.md) para la estructura completa.
 
 El perfil `quality_dreamidv.yaml` usa `dreamidv_faster.pth`, 832×480, 49
@@ -165,9 +166,12 @@ faceswap-pro run --config .\config\speed_dreamidv.yaml
 El backend divide vídeos largos en ventanas `4n+1` solapadas y desplaza fronteras a
 cortes de escena. Primero precalcula DWPose para todos los clips en un proceso
 separado; después cierra ese proceso, libera su VRAM y carga DreamID-V una sola vez.
-InsightFace también libera sus sesiones GPU tras completar el tracking. Si el worker
-de difusión falla, se reinicia de forma controlada en lugar de degradar
-silenciosamente a la CLI lenta. La referencia objetivo se usa para seguir a la
+InsightFace también libera sus sesiones GPU tras completar el tracking. El worker
+registra el backend SDPA que realmente ejecutó cada forma de atención; los perfiles
+incluidos desactivan `MATH`, de modo que una incompatibilidad de kernel falla rápido
+en vez de consumir muchas horas. Si el worker de difusión falla, se reinicia de
+forma controlada en lugar de degradar silenciosamente a la CLI lenta. La referencia
+objetivo se usa para seguir a la
 persona correcta y la salida se recompone únicamente dentro de sus máscaras
 temporales. Si la misma identidad aparece directamente y reflejada en un espejo,
 ambas regiones se incluyen en la composición.
@@ -246,6 +250,33 @@ máscara y conserva iluminación, fondo y oclusiones dentro del propio modelo.
 Esto es **condicionamiento generativo por 3DMM**, no un avatar 3D explícito con rig,
 texturas editables o render físico. El perfil sigue siendo independiente por frame;
 la consistencia temporal neuronal queda como una extensión separada futura.
+
+## Logs y perfilado de rendimiento
+
+Todos los comandos crean automáticamente la carpeta `logs/` con exactamente dos
+archivos acumulativos en formato JSON Lines:
+
+- `logs/logs.jsonl`: inicio y fin de ejecución, advertencias, bloqueos prolongados,
+  fallos de hilos y excepciones con traceback.
+- `logs/profile.jsonl`: spans jerárquicos, métricas por fotograma y rostro, esperas de
+  colas/futuros, tiempos de decodificación, detección, tracking, swap, composición,
+  restauración, alimentación al encoder, memoria Python y estadísticas `cProfile`
+  por función. Cuando el runtime no admite perfiles simultáneos, conserva los spans
+  atómicos y registra explícitamente esa limitación sin detener el procesamiento.
+
+El archivo de perfil añade también eventos `span_summary` ordenados por tiempo total,
+con conteo, promedio, mínimo, máximo y CPU acumulada por operación. Cada línea incluye
+`run_id`, timestamp, proceso e hilo, por lo que varias ejecuciones
+pueden convivir en los mismos archivos y filtrarse sin perder el historial. La ruta
+puede cambiarse para una ejecución completa colocando la opción global antes del
+comando:
+
+```powershell
+faceswap-pro --log-dir .\diagnostico run --config .\config\quality.yaml
+```
+
+El perfilado es intencionalmente detallado y añade cierta sobrecarga; sus mediciones
+permiten localizar cuellos de botella a nivel de etapa, fotograma, rostro y función.
 
 ## Pruebas
 

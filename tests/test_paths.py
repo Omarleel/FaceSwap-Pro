@@ -10,6 +10,7 @@ def test_create_project_directories(tmp_path):
     assert all(path.is_dir() for path in directories)
     assert (tmp_path / "inputs/source_faces").is_dir()
     assert (tmp_path / "outputs/manifests").is_dir()
+    assert (tmp_path / "logs").is_dir()
 
 
 def test_default_output_is_timestamped_and_not_in_project_root(tmp_path):

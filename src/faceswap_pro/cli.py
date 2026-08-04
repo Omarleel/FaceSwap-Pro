@@ -17,9 +17,16 @@ from .engine import (
     preload_gpu_runtime,
     register_builtin_model_backends,
 )
+from .observability import (
+    configure_observability,
+    log_exception,
+    log_problem,
+    profile_span,
+)
 from .paths import (
     DEFAULT_CONFIG,
     DEFAULT_INPUT_VIDEO,
+    DEFAULT_LOG_DIR,
     DEFAULT_MANIFEST_DIR,
     DEFAULT_OUTPUT_DIR,
     DEFAULT_SOURCE_DIR,
@@ -41,6 +48,24 @@ app = typer.Typer(
     help="FaceSwap-Pro: reemplazo facial local optimizado para GPU NVIDIA.",
 )
 console = Console()
+
+
+@app.callback()
+def configure_runtime(
+    ctx: typer.Context,
+    log_dir: Path = typer.Option(
+        DEFAULT_LOG_DIR,
+        "--log-dir",
+        file_okay=False,
+        help="Carpeta para logs estructurados y métricas de perfilado.",
+    ),
+) -> None:
+    """Inicializa observabilidad para todos los comandos."""
+    session = configure_observability(
+        log_dir,
+        command=ctx.invoked_subcommand or "cli",
+    )
+    ctx.call_on_close(session.close)
 
 
 def _resolve_model_path(config, override: Path | None = None) -> Path:
@@ -215,10 +240,15 @@ def run(
     ),
 ) -> None:
     """Procesa un sujeto objetivo identificado por una imagen de referencia."""
-    resolved_output = build_output_path(input_video, output_video, output_dir)
-    config = load_config(config_file)
-    effective_model = _resolve_model_path(config, model_path)
+    with profile_span("cli.resolve_run_configuration"):
+        resolved_output = build_output_path(input_video, output_video, output_dir)
+        config = load_config(config_file)
+        effective_model = _resolve_model_path(config, model_path)
     if not effective_model.exists():
+        log_problem(
+            "No existe el modelo principal configurado",
+            model_path=str(effective_model),
+        )
         raise typer.BadParameter(
             f"No existe el modelo principal: {effective_model}",
             param_hint="--model-path / engine.options.model_path",
@@ -226,15 +256,16 @@ def run(
     console.print(f"[cyan]Entrada:[/cyan] {input_video}")
     console.print(f"[cyan]Salida:[/cyan] {resolved_output}")
     console.print(f"[cyan]Modelo principal:[/cyan] {effective_model}")
-    run_pipeline(
-        input_video=input_video,
-        source_dir=source_dir,
-        target_reference=target_reference,
-        model_path=effective_model,
-        output_video=resolved_output,
-        manifest_dir=manifest_dir,
-        config=config,
-    )
+    with profile_span("cli.run_pipeline", input_video=str(input_video)):
+        run_pipeline(
+            input_video=input_video,
+            source_dir=source_dir,
+            target_reference=target_reference,
+            model_path=effective_model,
+            output_video=resolved_output,
+            manifest_dir=manifest_dir,
+            config=config,
+        )
 
 
 @app.command()
@@ -252,6 +283,7 @@ def doctor(
     try:
         import onnxruntime as ort
     except ModuleNotFoundError as exc:
+        log_exception("ONNX Runtime no está instalado", exc, command="doctor")
         console.print("[red]ONNX Runtime no está instalado en este entorno.[/red]")
         raise typer.Exit(code=2) from exc
     preload_gpu_runtime()
@@ -333,16 +365,31 @@ def doctor(
     if not report["cuda_provider_ok"]:
         raise typer.Exit(code=2)
     if not ffmpeg or not nvenc:
+        log_problem(
+            "GPU ONNX disponible, pero falta FFmpeg con h264_nvenc",
+            ffmpeg=ffmpeg,
+            h264_nvenc=nvenc,
+        )
         console.print("[yellow]GPU ONNX disponible, pero falta FFmpeg con h264_nvenc.[/yellow]")
     if configured_backend in {
         "insightface_inswapper_mediapipe_mesh",
         "mediapipe_3d_hybrid",
     } and not report["mediapipe_mesh_assist_ready"]:
+        log_problem(
+            "El backend asistido por malla no está listo",
+            mediapipe_installed=mediapipe_installed,
+            face_landmarker_model_exists=geometry_model.is_file(),
+        )
         console.print(
             "[yellow]El backend asistido por malla no está listo: instala MediaPipe "
             "y añade models/face_landmarker.task.[/yellow]"
         )
     if config_file is not None and not configured_backend_ready:
+        log_problem(
+            "El backend configurado no está listo",
+            backend=configured_backend,
+            config_file=str(config_file),
+        )
         console.print(
             "[red]El backend configurado no está listo. Revisa el bloque de "
             "diagnóstico anterior.[/red]"

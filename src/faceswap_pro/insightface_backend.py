@@ -14,6 +14,7 @@ from .modeling import (
     ModelCapabilities,
     SwapResult,
 )
+from .observability import profile_span
 
 BACKEND_NAME = "insightface_inswapper"
 
@@ -89,74 +90,89 @@ class SelectiveFaceAnalyzer:
         previous_bbox: np.ndarray | None,
         full_scan: bool,
     ) -> tuple[list[Any], DetectionStats]:
-        bboxes, keypoints = self.detector.detect(frame, max_num=0, metric="default")
+        with profile_span("insightface.detector.detect", full_scan=full_scan):
+            bboxes, keypoints = self.detector.detect(
+                frame,
+                max_num=0,
+                metric="default",
+            )
         if bboxes.shape[0] == 0:
             return [], DetectionStats(0, 0, full_scan)
 
-        detected_faces = []
-        for index in range(int(bboxes.shape[0])):
-            kps = keypoints[index] if keypoints is not None else None
-            detected_faces.append(
-                _new_native_face(
-                    bbox=bboxes[index, 0:4],
-                    kps=kps,
-                    det_score=float(bboxes[index, 4]),
+        with profile_span(
+            "insightface.detector.build_faces",
+            detected_count=int(bboxes.shape[0]),
+        ):
+            detected_faces = []
+            for index in range(int(bboxes.shape[0])):
+                kps = keypoints[index] if keypoints is not None else None
+                detected_faces.append(
+                    _new_native_face(
+                        bbox=bboxes[index, 0:4],
+                        kps=kps,
+                        det_score=float(bboxes[index, 4]),
+                    )
                 )
-            )
 
-        previous_bboxes = self._previous_bboxes(previous_bbox)
-        if full_scan or not previous_bboxes:
-            faces = sorted(detected_faces, key=self._quality_score, reverse=True)[
-                : self.max_faces
-            ]
-            candidates = faces
-        else:
-            faces = sorted(detected_faces, key=self._quality_score, reverse=True)[
-                : self.max_faces
-            ]
-            candidate_limit = min(
-                self.max_faces,
-                max(self.max_recognition_candidates, len(previous_bboxes)),
-            )
+        with profile_span("insightface.select_recognition_candidates"):
+            previous_bboxes = self._previous_bboxes(previous_bbox)
+            if full_scan or not previous_bboxes:
+                faces = sorted(detected_faces, key=self._quality_score, reverse=True)[
+                    : self.max_faces
+                ]
+                candidates = faces
+            else:
+                faces = sorted(detected_faces, key=self._quality_score, reverse=True)[
+                    : self.max_faces
+                ]
+                candidate_limit = min(
+                    self.max_faces,
+                    max(self.max_recognition_candidates, len(previous_bboxes)),
+                )
 
-            # Reserva primero un candidato distinto por trayectoria. Así el rostro
-            # real y su reflejo no compiten por un único cupo de reconocimiento.
-            candidates = []
-            used: set[int] = set()
-            for previous in previous_bboxes:
-                ranked = sorted(
-                    (
+                # Reserva primero un candidato distinto por trayectoria. Así el rostro
+                # real y su reflejo no compiten por un único cupo de reconocimiento.
+                candidates = []
+                used: set[int] = set()
+                for previous in previous_bboxes:
+                    ranked = sorted(
                         (
-                            self._continuity_score(face, previous, frame.shape),
-                            index,
-                            face,
-                        )
-                        for index, face in enumerate(faces)
-                        if index not in used
-                    ),
-                    key=lambda item: item[0],
-                    reverse=True,
-                )
-                if not ranked:
-                    break
-                _, index, face = ranked[0]
-                used.add(index)
-                candidates.append(face)
-                if len(candidates) >= candidate_limit:
-                    break
+                            (
+                                self._continuity_score(face, previous, frame.shape),
+                                index,
+                                face,
+                            )
+                            for index, face in enumerate(faces)
+                            if index not in used
+                        ),
+                        key=lambda item: item[0],
+                        reverse=True,
+                    )
+                    if not ranked:
+                        break
+                    _, index, face = ranked[0]
+                    used.add(index)
+                    candidates.append(face)
+                    if len(candidates) >= candidate_limit:
+                        break
 
-            # Los cupos restantes se llenan por calidad. Esto permite descubrir una
-            # reflexión que acaba de entrar en el encuadre sin esperar al full scan.
-            for index, face in enumerate(faces):
-                if len(candidates) >= candidate_limit:
-                    break
-                if index in used:
-                    continue
-                used.add(index)
-                candidates.append(face)
+                # Los cupos restantes se llenan por calidad. Esto permite descubrir una
+                # reflexión que acaba de entrar en el encuadre sin esperar al full scan.
+                for index, face in enumerate(faces):
+                    if len(candidates) >= candidate_limit:
+                        break
+                    if index in used:
+                        continue
+                    used.add(index)
+                    candidates.append(face)
 
-        for face in candidates:
-            self.recognizer.get(frame, face)
+        for candidate_index, face in enumerate(candidates):
+            with profile_span(
+                "insightface.recognizer.get",
+                candidate_index=candidate_index,
+                candidate_count=len(candidates),
+            ):
+                self.recognizer.get(frame, face)
 
         return candidates, DetectionStats(
             len(detected_faces),
@@ -225,7 +241,10 @@ class InsightFaceAnalyzer:
         )
 
     def find_faces(self, image: np.ndarray) -> list[FaceData]:
-        return [_to_face_data(face) for face in self._face_app.get(image)]
+        with profile_span("insightface.face_app.get"):
+            faces = self._face_app.get(image)
+        with profile_span("insightface.convert_faces", face_count=len(faces)):
+            return [_to_face_data(face) for face in faces]
 
     def analyze(
         self,
@@ -235,8 +254,10 @@ class InsightFaceAnalyzer:
     ) -> tuple[list[FaceData], DetectionStats]:
         if self._face_app is None or self._selective is None:
             raise RuntimeError("InsightFace ya liberó sus sesiones GPU.")
-        faces, stats = self._selective.analyze(frame, previous_bbox, full_scan)
-        return [_to_face_data(face) for face in faces], stats
+        with profile_span("insightface.selective_analyze", full_scan=full_scan):
+            faces, stats = self._selective.analyze(frame, previous_bbox, full_scan)
+        with profile_span("insightface.convert_faces", face_count=len(faces)):
+            return [_to_face_data(face) for face in faces], stats
 
     def release_gpu_resources(self) -> None:
         """Elimina sesiones ONNX después del tracking de un backend temporal."""
@@ -273,18 +294,23 @@ class InsightFaceSwapper:
         target_face: FaceData,
         source_face: FaceData,
     ) -> SwapResult:
-        crop, affine = self._model.get(
-            frame,
-            _to_insightface_face(target_face),
-            _to_insightface_face(source_face),
-            paste_back=False,
-        )
+        with profile_span("insightface.swapper.convert_faces"):
+            native_target = _to_insightface_face(target_face)
+            native_source = _to_insightface_face(source_face)
+        with profile_span("insightface.swapper.model_get"):
+            crop, affine = self._model.get(
+                frame,
+                native_target,
+                native_source,
+                paste_back=False,
+            )
         if crop is None or affine is None:
             raise RuntimeError("El modelo INSwapper no devolvió recorte y transformación.")
-        return SwapResult(
-            crop=np.asarray(crop),
-            affine=np.asarray(affine, dtype=np.float32),
-        )
+        with profile_span("insightface.swapper.convert_output"):
+            return SwapResult(
+                crop=np.asarray(crop),
+                affine=np.asarray(affine, dtype=np.float32),
+            )
 
 
 class InsightFaceAnalysisServices:
@@ -302,18 +328,22 @@ def create_insightface_analysis_services(config: Any) -> InsightFaceAnalysisServ
     import onnxruntime as ort
     from insightface.app import FaceAnalysis
 
-    preload_gpu_runtime()
-    providers = build_providers(engine_config)
-    face_app = FaceAnalysis(
-        name=engine_config.model_pack,
-        allowed_modules=list(engine_config.allowed_modules),
-        providers=providers,
-    )
-    face_app.prepare(
-        ctx_id=int(engine_config.cuda.get("device_id", 0)),
-        det_thresh=engine_config.det_thresh,
-        det_size=engine_config.det_size,
-    )
+    with profile_span("insightface.preload_gpu_runtime"):
+        preload_gpu_runtime()
+    with profile_span("insightface.build_providers"):
+        providers = build_providers(engine_config)
+    with profile_span("insightface.face_analysis.initialize"):
+        face_app = FaceAnalysis(
+            name=engine_config.model_pack,
+            allowed_modules=list(engine_config.allowed_modules),
+            providers=providers,
+        )
+    with profile_span("insightface.face_analysis.prepare"):
+        face_app.prepare(
+            ctx_id=int(engine_config.cuda.get("device_id", 0)),
+            det_thresh=engine_config.det_thresh,
+            det_size=engine_config.det_size,
+        )
     analyzer = InsightFaceAnalyzer(
         face_app,
         max_faces=engine_config.max_faces,
@@ -344,12 +374,14 @@ class InsightFaceBackendFactory:
                 "restaura engine.model_pack: buffalo_l."
             )
 
-        services = create_insightface_analysis_services(config)
-        model = insightface.model_zoo.get_model(
-            str(model_path),
-            download=False,
-            providers=list(services.providers),
-        )
+        with profile_span("insightface.create_analysis_services"):
+            services = create_insightface_analysis_services(config)
+        with profile_span("insightface.load_swapper_model", model_path=str(model_path)):
+            model = insightface.model_zoo.get_model(
+                str(model_path),
+                download=False,
+                providers=list(services.providers),
+            )
         if model is None:
             raise RuntimeError(f"No se pudo cargar el modelo swapper: {model_path}")
 

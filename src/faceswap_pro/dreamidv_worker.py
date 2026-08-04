@@ -39,6 +39,13 @@ class WorkerRuntime:
         self.args = args
         self.repository = repository
         package_name = "dreamidv_wan_faster" if args.variant == "faster" else "dreamidv_wan"
+        from faceswap_pro.dreamidv_sdpa import (
+            install_attention_override,
+            sdpa_runtime_summary,
+        )
+
+        install_attention_override(package_name)
+        print(f"FaceSwap-Pro SDPA configurado: {sdpa_runtime_summary()}", flush=True)
         package = importlib.import_module(package_name)
         configs = importlib.import_module(f"{package_name}.configs")
         utils = importlib.import_module(f"{package_name}.utils.utils")

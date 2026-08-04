@@ -10,6 +10,7 @@ from .modeling import (
     create_model_bundle,
     register_model_backend,
 )
+from .observability import log_problem, profile_span
 
 _BUILTINS_REGISTERED = False
 
@@ -30,15 +31,25 @@ def preload_gpu_runtime() -> None:
     # lugar de precargar otra familia de CUDA desde site-packages.
     try:
         import torch  # noqa: F401
-    except Exception:
-        pass
+    except Exception as exc:
+        log_problem(
+            "PyTorch no pudo precargarse antes de ONNX Runtime",
+            exception_type=type(exc).__name__,
+            detail=str(exc),
+        )
 
-    ort = _load_onnxruntime()
+    with profile_span("runtime.load_onnxruntime"):
+        ort = _load_onnxruntime()
     try:
-        ort.preload_dlls()
-    except Exception:
+        with profile_span("runtime.preload_onnx_dlls"):
+            ort.preload_dlls()
+    except Exception as exc:
         # En Linux o con CUDA instalada en el sistema puede no ser necesario.
-        pass
+        log_problem(
+            "ONNX Runtime no pudo precargar DLL; puede ser normal según el sistema",
+            exception_type=type(exc).__name__,
+            detail=str(exc),
+        )
 
 
 def build_providers(config) -> list:

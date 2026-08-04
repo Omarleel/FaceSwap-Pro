@@ -214,9 +214,14 @@ function Fix-DreamIdVDoctorImportOrder {
 }
 
 function Enable-DreamIdVTorchAttentionFallback {
-    $modelPath = Join-Path $script:ProjectRoot "third_party\DreamID-V\dreamidv_wan_faster\modules\model.py"
+    $moduleDirectory = Join-Path $script:ProjectRoot "third_party\DreamID-V\dreamidv_wan_faster\modules"
+    $modelPath = Join-Path $moduleDirectory "model.py"
+    $attentionPath = Join-Path $moduleDirectory "attention.py"
     if (-not (Test-Path $modelPath -PathType Leaf)) {
         throw "No se encontró el módulo Faster de DreamID-V: $modelPath"
+    }
+    if (-not (Test-Path $attentionPath -PathType Leaf)) {
+        throw "No se encontró attention.py de DreamID-V: $attentionPath"
     }
 
     $content = [System.IO.File]::ReadAllText($modelPath)
@@ -228,12 +233,39 @@ function Enable-DreamIdVTorchAttentionFallback {
 
     if ($updated -ne $content) {
         Set-Utf8FileContent -Path $modelPath -Content $updated
-        Write-Info "DreamID-V Faster configurado para usar el wrapper de atención de PyTorch/FlashAttention."
     }
-
     if ($updated.Contains("flash_attention(")) {
         throw "No se pudieron reemplazar todas las llamadas directas a flash_attention."
     }
+
+    $backupPath = "$attentionPath.upstream.bak"
+    if (-not (Test-Path $backupPath -PathType Leaf)) {
+        Copy-Item -Path $attentionPath -Destination $backupPath -Force
+    }
+
+    $facade = @'
+"""Adaptador instalado por FaceSwap-Pro.
+
+La implementación real vive en faceswap_pro.dreamidv_sdpa para poder corregir
+máscaras, seleccionar kernels fusionados y registrar el backend efectivo sin
+mantener un fork completo de DreamID-V.
+"""
+from faceswap_pro.dreamidv_sdpa import (
+    attention,
+    flash_attention,
+    install_attention_override,
+    sdpa_runtime_summary,
+)
+
+__all__ = [
+    "attention",
+    "flash_attention",
+    "install_attention_override",
+    "sdpa_runtime_summary",
+]
+'@
+    Set-Utf8FileContent -Path $attentionPath -Content $facade
+    Write-Info "DreamID-V Faster configurado con SDPA nativo, máscara correcta y selección explícita de kernels."
 }
 
 function Test-WanCheckpoint {

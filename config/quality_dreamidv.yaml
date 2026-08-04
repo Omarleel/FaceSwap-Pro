@@ -58,6 +58,14 @@ engine:
     worker_fallback: false
     release_analysis_gpu: true
 
+    # SDPA nativo: en Windows/Blackwell se intenta cuDNN primero, después
+    # FlashAttention y Efficient Attention. MATH queda desactivado para no
+    # convertir un fallo de kernel en una ejecución de muchas horas.
+    sdpa_backend_priority: [cudnn, flash, efficient, math]
+    sdpa_allow_math_fallback: false
+    sdpa_padding_mode: ragged
+    sdpa_diagnostics: true
+
     # Banco de identidad y selección del sujeto objetivo.
     reference_bank_size: 6
     target_ambiguity_margin: 0.05

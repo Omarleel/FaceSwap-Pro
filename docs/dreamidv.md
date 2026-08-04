@@ -36,7 +36,7 @@ El script:
 2. deja una sola variante de OpenCV;
 3. deja únicamente `onnxruntime-gpu`;
 4. instala las dependencias compatibles de DreamID-V;
-5. clona DreamID-V y aplica el wrapper de atención de PyTorch/FlashAttention;
+5. clona DreamID-V e instala el adaptador SDPA nativo de FaceSwap-Pro;
 6. descarga DreamID-V Faster, Wan 2.1 y DWPose;
 7. ejecuta el diagnóstico final.
 
@@ -97,6 +97,53 @@ perder algo de detalle frente al perfil de 16 pasos.
 8. **Stitching y composición.** Las ventanas se mezclan en los solapes y el vídeo
    original se conserva fuera de las máscaras del actor y su reflexión.
 
+
+## SDPA nativo y selección real del kernel
+
+El adaptador `faceswap_pro.dreamidv_sdpa` reemplaza únicamente la función de
+atención de DreamID-V Faster; no modifica los pesos. Corrige cuatro problemas del
+fallback upstream:
+
+1. respeta `q_lens` y `k_lens`;
+2. aplica `q_scale` y `softmax_scale`;
+3. recorta padding por muestra para no construir una matriz `L×S` gigantesca;
+4. fuerza un backend por vez y registra cuál ejecutó realmente la operación.
+
+Configuración recomendada para una RTX 5060 Ti/5070 Ti de 16 GB:
+
+```yaml
+sdpa_backend_priority: [cudnn, flash, efficient, math]
+sdpa_allow_math_fallback: false
+sdpa_padding_mode: ragged
+sdpa_diagnostics: true
+```
+
+`ragged` recorta cada secuencia a su longitud válida y suele conservar la ruta
+fusionada. `mask` usa una máscara booleana compacta `[B, 1, 1, S]`, donde `true`
+significa que la clave participa en SDPA. La máscara se ofrece para validación o
+lotes variables; DreamID-V normalmente procesa lote 1 y se beneficia más de
+`ragged`.
+
+Antes de lanzar un vídeo largo se puede comprobar el soporte fusionado con:
+
+```powershell
+python .\scripts\probe_dreamidv_sdpa.py --seq-len 2048
+```
+
+La prueba sintética no sustituye la selección con las longitudes reales, pero evita
+iniciar DreamID-V cuando la instalación no expone ningún kernel fusionado.
+
+Al comenzar la primera atención aparecerá una línea como:
+
+```text
+FaceSwap-Pro SDPA: backend=CUDNN, torch=..., gpu=..., dtype=..., q=..., k=..., mask=none
+```
+
+Ese backend no es una estimación: la llamada se ejecuta dentro de un contexto que
+habilita únicamente ese kernel. Si cuDNN falla, se prueba Flash y luego Efficient.
+Con `sdpa_allow_math_fallback: false`, si ninguno funciona la ejecución termina con
+un diagnóstico inmediato. Activa MATH solo para depuración de clips diminutos.
+
 ## Parámetros de memoria
 
 ```yaml
@@ -140,10 +187,11 @@ Estos avisos no bloquean por sí solos:
 
 - `FutureWarning` de `torch.cuda.amp.autocast`;
 - nodos ONNX asignados al CPU para operaciones de forma;
-- aviso de máscara de padding al usar SDPA.
+- mensajes de diagnóstico que descartan un backend fusionado y prueban el siguiente.
 
 Sí debe detenerse la ejecución ante `CUDA out of memory`, archivos de máscara
-ausentes o un worker que agote sus reinicios.
+ausentes, un worker que agote sus reinicios o el mensaje `Ningún kernel SDPA
+fusionado pudo ejecutar DreamID-V`.
 
 ## Salidas
 

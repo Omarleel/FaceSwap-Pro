@@ -27,3 +27,5 @@ outputs/manifests/*
 *.mp4
 *.jpg
 *.zip
+# Observabilidad local
+logs/*.jsonl

@@ -74,6 +74,10 @@ class DreamIDVOptions:
     worker_restart_attempts: int
     worker_fallback: bool
     release_analysis_gpu: bool
+    sdpa_backend_priority: tuple[str, ...]
+    sdpa_allow_math_fallback: bool
+    sdpa_padding_mode: str
+    sdpa_diagnostics: bool
     reference_bank_size: int
     target_ambiguity_margin: float
     target_min_coverage: float
@@ -179,6 +183,14 @@ class DreamIDVOptions:
             worker_restart_attempts=max(0, int(options.get("worker_restart_attempts", 1))),
             worker_fallback=bool(options.get("worker_fallback", True)),
             release_analysis_gpu=bool(options.get("release_analysis_gpu", True)),
+            sdpa_backend_priority=_parse_sdpa_priority(
+                options.get("sdpa_backend_priority", ["cudnn", "flash", "efficient", "math"])
+            ),
+            sdpa_allow_math_fallback=bool(options.get("sdpa_allow_math_fallback", False)),
+            sdpa_padding_mode=_parse_sdpa_padding_mode(
+                options.get("sdpa_padding_mode", "ragged")
+            ),
+            sdpa_diagnostics=bool(options.get("sdpa_diagnostics", True)),
             reference_bank_size=max(1, int(options.get("reference_bank_size", 6))),
             target_ambiguity_margin=ambiguity_margin,
             target_min_coverage=min_coverage,
@@ -192,6 +204,40 @@ class DreamIDVOptions:
             benchmark_interval=max(1, int(options.get("benchmark_interval", 8))),
             hdr_policy=hdr_policy,
         )
+
+
+def _parse_sdpa_priority(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, Sequence):
+        items = list(value)
+    else:
+        raise ValueError("sdpa_backend_priority debe ser una lista o cadena separada por comas.")
+    aliases = {
+        "flash_attention": "flash",
+        "cudnn_attention": "cudnn",
+        "memory_efficient": "efficient",
+        "efficient_attention": "efficient",
+    }
+    result: list[str] = []
+    for item in items:
+        name = aliases.get(str(item).strip().lower(), str(item).strip().lower())
+        if name not in {"cudnn", "flash", "efficient", "math"}:
+            raise ValueError(
+                "sdpa_backend_priority solo admite cudnn, flash, efficient y math."
+            )
+        if name not in result:
+            result.append(name)
+    if not result:
+        raise ValueError("sdpa_backend_priority no puede estar vacío.")
+    return tuple(result)
+
+
+def _parse_sdpa_padding_mode(value: Any) -> str:
+    mode = str(value).strip().lower()
+    if mode not in {"ragged", "mask"}:
+        raise ValueError("sdpa_padding_mode debe ser ragged o mask.")
+    return mode
 
 
 def _required_path(options: Mapping[str, Any], name: str) -> Path:
@@ -548,6 +594,12 @@ def _dreamidv_environment(options: DreamIDVOptions) -> dict[str, str]:
         allocator = "expandable_segments:True," + allocator
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", allocator)
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
+    env["FACESWAP_SDPA_BACKENDS"] = ",".join(options.sdpa_backend_priority)
+    env["FACESWAP_SDPA_ALLOW_MATH"] = (
+        "1" if options.sdpa_allow_math_fallback else "0"
+    )
+    env["FACESWAP_SDPA_PADDING_MODE"] = options.sdpa_padding_mode
+    env["FACESWAP_SDPA_DIAGNOSTICS"] = "1" if options.sdpa_diagnostics else "0"
     return env
 
 
@@ -1215,6 +1267,10 @@ class DreamIDVBackendFactory:
                 "precompute_pose": options.precompute_pose,
                 "worker_restart_attempts": options.worker_restart_attempts,
                 "release_analysis_gpu": options.release_analysis_gpu,
+                "sdpa_backend_priority": options.sdpa_backend_priority,
+                "sdpa_allow_math_fallback": options.sdpa_allow_math_fallback,
+                "sdpa_padding_mode": options.sdpa_padding_mode,
+                "sdpa_diagnostics": options.sdpa_diagnostics,
                 "offload_model": options.offload_model,
                 "t5_cpu": options.t5_cpu,
                 "python_executable": options.python_executable,
@@ -1299,6 +1355,7 @@ def dreamidv_readiness(
             )
             else True
         ),
+        "native_sdpa_bridge": Path(__file__).with_name("dreamidv_sdpa.py").is_file(),
     }
     environment: dict[str, Any] | None = None
     if probe_environment and python_ok:
@@ -1327,6 +1384,10 @@ def dreamidv_readiness(
             "precompute_pose": options.precompute_pose,
             "worker_restart_attempts": options.worker_restart_attempts,
             "release_analysis_gpu": options.release_analysis_gpu,
+            "sdpa_backend_priority": options.sdpa_backend_priority,
+            "sdpa_allow_math_fallback": options.sdpa_allow_math_fallback,
+            "sdpa_padding_mode": options.sdpa_padding_mode,
+            "sdpa_diagnostics": options.sdpa_diagnostics,
         },
         "checks": checks,
         "environment": environment,
@@ -1358,6 +1419,22 @@ try:
         "diffusers": diffusers.__version__,
         "transformers": transformers.__version__,
         "onnxruntime": onnxruntime.__version__,
+        "cudnn": torch.backends.cudnn.version(),
+        "compute_capability": (
+            list(torch.cuda.get_device_capability(0)) if torch.cuda.is_available() else None
+        ),
+        "sdpa_kernel_api": bool(
+            hasattr(torch.nn, "attention")
+            and hasattr(torch.nn.attention, "sdpa_kernel")
+            and hasattr(torch.nn.attention, "SDPBackend")
+        ),
+        "sdpa_backends": (
+            list(torch.nn.attention.SDPBackend.__members__.keys())
+            if hasattr(torch.nn, "attention")
+            and hasattr(torch.nn.attention, "SDPBackend")
+            and hasattr(torch.nn.attention.SDPBackend, "__members__")
+            else []
+        ),
     })
 except Exception as exc:
     payload["error"] = f"{type(exc).__name__}: {exc}"

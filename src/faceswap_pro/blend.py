@@ -3,6 +3,8 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+from .observability import profile_span
+
 
 _INTERPOLATIONS = {
     "linear": cv2.INTER_LINEAR,
@@ -34,14 +36,18 @@ class ProfessionalBlender:
         self._cached_mask = self._build_mask(self.aligned_size)
 
     def _build_mask(self, size: int) -> np.ndarray:
-        mask = np.zeros((size, size), dtype=np.float32)
-        center = (size // 2, int(size * 0.52))
-        axes = (int(size * 0.43 * self.mask_shrink), int(size * 0.49 * self.mask_shrink))
-        cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1, cv2.LINE_AA)
-        blur = max(5, int(size * self.mask_blur_ratio))
-        if blur % 2 == 0:
-            blur += 1
-        return cv2.GaussianBlur(mask, (blur, blur), 0)[..., None]
+        with profile_span("blend.build_mask", aligned_size=size):
+            mask = np.zeros((size, size), dtype=np.float32)
+            center = (size // 2, int(size * 0.52))
+            axes = (
+                int(size * 0.43 * self.mask_shrink),
+                int(size * 0.49 * self.mask_shrink),
+            )
+            cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1, cv2.LINE_AA)
+            blur = max(5, int(size * self.mask_blur_ratio))
+            if blur % 2 == 0:
+                blur += 1
+            return cv2.GaussianBlur(mask, (blur, blur), 0)[..., None]
 
     @staticmethod
     def _lab_statistics(image: np.ndarray, mask: np.ndarray):
@@ -55,19 +61,30 @@ class ProfessionalBlender:
     def _color_match(self, fake: np.ndarray, target: np.ndarray, mask: np.ndarray) -> np.ndarray:
         if self.color_match_strength <= 0:
             return fake
-        fake_lab, fake_mean, fake_std = self._lab_statistics(fake, mask)
-        _, target_mean, target_std = self._lab_statistics(target, mask)
-        matched = (fake_lab - fake_mean) * (target_std / fake_std) + target_mean
-        matched = np.clip(matched, 0, 255).astype(np.uint8)
-        matched = cv2.cvtColor(matched, cv2.COLOR_LAB2BGR)
-        strength = float(np.clip(self.color_match_strength, 0.0, 1.0))
-        return cv2.addWeighted(matched, strength, fake, 1.0 - strength, 0)
+        with profile_span("blend.color_match.statistics.fake"):
+            fake_lab, fake_mean, fake_std = self._lab_statistics(fake, mask)
+        with profile_span("blend.color_match.statistics.target"):
+            _, target_mean, target_std = self._lab_statistics(target, mask)
+        with profile_span("blend.color_match.transform"):
+            matched = (fake_lab - fake_mean) * (target_std / fake_std) + target_mean
+            matched = np.clip(matched, 0, 255).astype(np.uint8)
+            matched = cv2.cvtColor(matched, cv2.COLOR_LAB2BGR)
+            strength = float(np.clip(self.color_match_strength, 0.0, 1.0))
+            return cv2.addWeighted(matched, strength, fake, 1.0 - strength, 0)
 
     def _detail(self, image: np.ndarray) -> np.ndarray:
         if self.detail_strength <= 0:
             return image
-        blur = cv2.GaussianBlur(image, (0, 0), 1.15)
-        return cv2.addWeighted(image, 1.0 + self.detail_strength, blur, -self.detail_strength, 0)
+        with profile_span("blend.detail.gaussian_blur"):
+            blur = cv2.GaussianBlur(image, (0, 0), 1.15)
+        with profile_span("blend.detail.add_weighted"):
+            return cv2.addWeighted(
+                image,
+                1.0 + self.detail_strength,
+                blur,
+                -self.detail_strength,
+                0,
+            )
 
     def _prepare_aligned(
         self,
@@ -79,51 +96,69 @@ class ProfessionalBlender:
         opacity: float = 1.0,
         mask_mode: str = "multiply",
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        scale = self.aligned_size / float(fake_128.shape[0])
-        affine = np.asarray(affine_128, dtype=np.float32).copy()
-        affine[:, :] *= scale
-        aligned_target = cv2.warpAffine(
-            frame,
-            affine,
-            (self.aligned_size, self.aligned_size),
-            flags=self.interpolation,
-            borderMode=cv2.BORDER_REFLECT_101,
-        )
-        fake = cv2.resize(
-            fake_128,
-            (self.aligned_size, self.aligned_size),
-            interpolation=self.interpolation,
-        )
-        fake = restorer.restore(fake)
-        mask = self._cached_mask.copy()
-        if supplied_mask is not None:
-            adaptive = np.asarray(supplied_mask, dtype=np.float32)
-            if adaptive.ndim == 2:
-                adaptive = adaptive[..., None]
-            if adaptive.shape[:2] != (self.aligned_size, self.aligned_size):
-                adaptive = cv2.resize(
-                    adaptive,
-                    (self.aligned_size, self.aligned_size),
-                    interpolation=cv2.INTER_LINEAR,
-                )
+        with profile_span("blend.prepare.affine_scale"):
+            scale = self.aligned_size / float(fake_128.shape[0])
+            affine = np.asarray(affine_128, dtype=np.float32).copy()
+            affine[:, :] *= scale
+        with profile_span("blend.prepare.warp_target"):
+            aligned_target = cv2.warpAffine(
+                frame,
+                affine,
+                (self.aligned_size, self.aligned_size),
+                flags=self.interpolation,
+                borderMode=cv2.BORDER_REFLECT_101,
+            )
+        with profile_span("blend.prepare.resize_fake"):
+            fake = cv2.resize(
+                fake_128,
+                (self.aligned_size, self.aligned_size),
+                interpolation=self.interpolation,
+            )
+        with profile_span(
+            "blend.prepare.restore",
+            restorer_enabled=bool(getattr(restorer, "enabled", False)),
+        ):
+            fake = restorer.restore(fake)
+        with profile_span(
+            "blend.prepare.mask",
+            supplied_mask=bool(supplied_mask is not None),
+            mask_mode=mask_mode,
+        ):
+            mask = self._cached_mask.copy()
+            if supplied_mask is not None:
+                adaptive = np.asarray(supplied_mask, dtype=np.float32)
                 if adaptive.ndim == 2:
                     adaptive = adaptive[..., None]
-            if mask_mode == "replace":
-                mask = np.clip(adaptive, 0.0, 1.0)
-            elif mask_mode == "multiply":
-                mask = np.clip(mask * adaptive, 0.0, 1.0)
-            else:
+                if adaptive.shape[:2] != (self.aligned_size, self.aligned_size):
+                    adaptive = cv2.resize(
+                        adaptive,
+                        (self.aligned_size, self.aligned_size),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                    if adaptive.ndim == 2:
+                        adaptive = adaptive[..., None]
+                if mask_mode == "replace":
+                    mask = np.clip(adaptive, 0.0, 1.0)
+                elif mask_mode == "multiply":
+                    mask = np.clip(mask * adaptive, 0.0, 1.0)
+                else:
+                    raise ValueError(
+                        "mask_mode debe ser 'multiply' o 'replace', "
+                        f"recibido: {mask_mode!r}."
+                    )
+            elif mask_mode not in {"multiply", "replace"}:
                 raise ValueError(
-                    f"mask_mode debe ser 'multiply' o 'replace', recibido: {mask_mode!r}."
+                    "mask_mode debe ser 'multiply' o 'replace', "
+                    f"recibido: {mask_mode!r}."
                 )
-        elif mask_mode not in {"multiply", "replace"}:
-            raise ValueError(
-                f"mask_mode debe ser 'multiply' o 'replace', recibido: {mask_mode!r}."
-            )
-        mask *= float(np.clip(opacity, 0.0, 1.0))
-        fake = self._color_match(fake, aligned_target, mask)
-        fake = self._detail(fake)
-        return fake, mask, cv2.invertAffineTransform(affine)
+            mask *= float(np.clip(opacity, 0.0, 1.0))
+        with profile_span("blend.prepare.color_match"):
+            fake = self._color_match(fake, aligned_target, mask)
+        with profile_span("blend.prepare.detail"):
+            fake = self._detail(fake)
+        with profile_span("blend.prepare.invert_affine"):
+            inverse = cv2.invertAffineTransform(affine)
+        return fake, mask, inverse
 
     def _roi_bounds(self, inverse: np.ndarray, frame_shape) -> tuple[int, int, int, int] | None:
         size = float(self.aligned_size - 1)
@@ -150,7 +185,8 @@ class ProfessionalBlender:
         mask: np.ndarray,
         inverse: np.ndarray,
     ) -> np.ndarray:
-        bounds = self._roi_bounds(inverse, frame.shape)
+        with profile_span("blend.roi.bounds"):
+            bounds = self._roi_bounds(inverse, frame.shape)
         if bounds is None:
             return frame
         x1, y1, x2, y2 = bounds
@@ -159,27 +195,38 @@ class ProfessionalBlender:
         roi_transform[0, 2] -= x1
         roi_transform[1, 2] -= y1
 
-        warped_fake = cv2.warpAffine(
-            fake,
-            roi_transform,
-            (roi_width, roi_height),
-            flags=self.interpolation,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )
-        warped_mask = cv2.warpAffine(
-            mask[..., 0],
-            roi_transform,
-            (roi_width, roi_height),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )[..., None]
-        target = frame[y1:y2, x1:x2]
-        blended = warped_mask * warped_fake.astype(np.float32) + (
-            1.0 - warped_mask
-        ) * target.astype(np.float32)
-        target[:] = np.clip(blended, 0, 255).astype(np.uint8)
+        with profile_span(
+            "blend.roi.warp_fake",
+            roi_width=roi_width,
+            roi_height=roi_height,
+        ):
+            warped_fake = cv2.warpAffine(
+                fake,
+                roi_transform,
+                (roi_width, roi_height),
+                flags=self.interpolation,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+        with profile_span(
+            "blend.roi.warp_mask",
+            roi_width=roi_width,
+            roi_height=roi_height,
+        ):
+            warped_mask = cv2.warpAffine(
+                mask[..., 0],
+                roi_transform,
+                (roi_width, roi_height),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )[..., None]
+        with profile_span("blend.roi.alpha_blend"):
+            target = frame[y1:y2, x1:x2]
+            blended = warped_mask * warped_fake.astype(np.float32) + (
+                1.0 - warped_mask
+            ) * target.astype(np.float32)
+            target[:] = np.clip(blended, 0, 255).astype(np.uint8)
         return frame
 
     def _composite_full(
@@ -190,26 +237,29 @@ class ProfessionalBlender:
         inverse: np.ndarray,
     ) -> np.ndarray:
         h, w = frame.shape[:2]
-        warped_fake = cv2.warpAffine(
-            fake,
-            inverse,
-            (w, h),
-            flags=self.interpolation,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )
-        warped_mask = cv2.warpAffine(
-            mask[..., 0],
-            inverse,
-            (w, h),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )[..., None]
-        output = warped_mask * warped_fake.astype(np.float32) + (
-            1.0 - warped_mask
-        ) * frame.astype(np.float32)
-        return np.clip(output, 0, 255).astype(np.uint8)
+        with profile_span("blend.full.warp_fake", width=w, height=h):
+            warped_fake = cv2.warpAffine(
+                fake,
+                inverse,
+                (w, h),
+                flags=self.interpolation,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+        with profile_span("blend.full.warp_mask", width=w, height=h):
+            warped_mask = cv2.warpAffine(
+                mask[..., 0],
+                inverse,
+                (w, h),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )[..., None]
+        with profile_span("blend.full.alpha_blend"):
+            output = warped_mask * warped_fake.astype(np.float32) + (
+                1.0 - warped_mask
+            ) * frame.astype(np.float32)
+            return np.clip(output, 0, 255).astype(np.uint8)
 
     def composite(
         self,
@@ -222,15 +272,18 @@ class ProfessionalBlender:
         opacity: float = 1.0,
         mask_mode: str = "multiply",
     ) -> np.ndarray:
-        fake, mask, inverse = self._prepare_aligned(
-            frame,
-            fake_128,
-            affine_128,
-            restorer,
-            supplied_mask=mask,
-            opacity=opacity,
-            mask_mode=mask_mode,
-        )
+        with profile_span("blend.prepare_aligned"):
+            fake, mask, inverse = self._prepare_aligned(
+                frame,
+                fake_128,
+                affine_128,
+                restorer,
+                supplied_mask=mask,
+                opacity=opacity,
+                mask_mode=mask_mode,
+            )
         if self.roi_enabled:
-            return self._composite_roi(frame, fake, mask, inverse)
-        return self._composite_full(frame, fake, mask, inverse)
+            with profile_span("blend.composite_roi"):
+                return self._composite_roi(frame, fake, mask, inverse)
+        with profile_span("blend.composite_full"):
+            return self._composite_full(frame, fake, mask, inverse)

@@ -10,6 +10,7 @@ DEFAULT_SWAPPER_MODEL = Path("models/inswapper_128.onnx")
 DEFAULT_CONFIG = Path("config/max_speed.yaml")
 DEFAULT_OUTPUT_DIR = Path("outputs/videos")
 DEFAULT_MANIFEST_DIR = Path("outputs/manifests")
+DEFAULT_LOG_DIR = Path("logs")
 
 PROJECT_DIRECTORIES = (
     Path("inputs/videos"),
@@ -22,6 +23,7 @@ PROJECT_DIRECTORIES = (
     Path("third_party"),
     DEFAULT_OUTPUT_DIR,
     DEFAULT_MANIFEST_DIR,
+    DEFAULT_LOG_DIR,
 )
 
 
